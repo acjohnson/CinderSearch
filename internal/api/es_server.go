@@ -34,7 +34,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Root cluster info banner (Elasticsearch compatible)
 	if path == "/" && r.Method == http.MethodGet {
-		s.writeJSON(w, http.StatusOK, map[string]any{
+		s.writeJSON(w, r, http.StatusOK, map[string]any{
 			"name":         s.node.ID(),
 			"cluster_name": "cindersearch-cluster",
 			"tagline":      "You Know, for Search (CinderSearch S3+NVMe Engine)",
@@ -57,16 +57,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Cluster-wide routes
 	switch {
 	case path == "/_cluster/health" && r.Method == http.MethodGet:
-		s.handleClusterHealth(w)
+		s.handleClusterHealth(w, r)
 		return
 	case path == "/_cat/indices" && r.Method == http.MethodGet:
-		s.handleCatIndices(w)
+		s.handleCatIndices(w, r)
 		return
 	case path == "/_cat/shards" && r.Method == http.MethodGet:
-		s.handleCatShards(w)
+		s.handleCatShards(w, r)
 		return
 	case path == "/_cinder/stats" && r.Method == http.MethodGet:
-		s.writeJSON(w, http.StatusOK, s.node.Stats())
+		s.writeJSON(w, r, http.StatusOK, s.node.Stats())
 		return
 	case path == "/_bulk" && (r.Method == http.MethodPost || r.Method == http.MethodPut):
 		s.handleBulk(w, r, "")
@@ -81,7 +81,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(trimmed, "/")
 	indexName := parts[0]
 	if indexName == "" || strings.HasPrefix(indexName, "_") {
-		s.writeESError(w, http.StatusNotFound, "no_such_route", "unknown endpoint "+path)
+		s.writeESError(w, r, http.StatusNotFound, "no_such_route", "unknown endpoint "+path)
 		return
 	}
 
@@ -90,11 +90,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPut:
 			s.handleCreateIndex(w, r, indexName)
 		case http.MethodGet:
-			s.handleGetIndex(w, indexName)
+			s.handleGetIndex(w, r, indexName)
 		case http.MethodDelete:
 			s.handleDeleteIndex(w, r, indexName)
 		default:
-			s.writeESError(w, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
+			s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
 		}
 		return
 	}
@@ -104,10 +104,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "_refresh":
 		flush := r.URL.Query().Get("flush") == "true"
 		if err := s.node.RefreshIndex(r.Context(), indexName, flush, true); err != nil {
-			s.writeESError(w, http.StatusInternalServerError, "refresh_error", err.Error())
+			s.writeESError(w, r, http.StatusInternalServerError, "refresh_error", err.Error())
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0}})
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0}})
 	case "_bulk":
 		s.handleBulk(w, r, indexName)
 	case "_search":
@@ -121,12 +121,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleDoc(w, r, indexName, docID)
 	case "_update":
 		if len(parts) < 3 {
-			s.writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "document id required")
+			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required")
 			return
 		}
 		s.handleUpdateDoc(w, r, indexName, parts[2])
 	default:
-		s.writeESError(w, http.StatusNotFound, "no_such_route", "unknown index action "+action)
+		s.writeESError(w, r, http.StatusNotFound, "no_such_route", "unknown index action "+action)
 	}
 }
 
@@ -136,68 +136,68 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, path str
 		if r.Method == http.MethodDelete {
 			idx := r.URL.Query().Get("index")
 			_ = s.node.DeleteIndex(r.Context(), idx, false)
-			s.writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 			return
 		}
 		var meta cluster.IndexMetadata
 		if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
-			s.writeESError(w, http.StatusBadRequest, "json_parse_exception", err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "json_parse_exception", err.Error())
 			return
 		}
 		if err := s.node.ApplyIndexMetadata(r.Context(), meta); err != nil {
-			s.writeESError(w, http.StatusInternalServerError, "sync_error", err.Error())
+			s.writeESError(w, r, http.StatusInternalServerError, "sync_error", err.Error())
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 
 	case "/_internal/refresh":
 		idx := r.URL.Query().Get("index")
 		flush := r.URL.Query().Get("flush") == "true"
 		if err := s.node.RefreshIndex(r.Context(), idx, flush, false); err != nil {
-			s.writeESError(w, http.StatusInternalServerError, "refresh_error", err.Error())
+			s.writeESError(w, r, http.StatusInternalServerError, "refresh_error", err.Error())
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"ok": true})
 
 	case "/_internal/replicate":
 		var req cluster.ReplicateBatchRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			s.writeESError(w, http.StatusBadRequest, "json_parse_exception", err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "json_parse_exception", err.Error())
 			return
 		}
 		ackSeq, err := s.node.ApplyReplicaBatch(r.Context(), req)
 		if err != nil {
-			s.writeESError(w, http.StatusBadRequest, "replication_error", err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "replication_error", err.Error())
 			return
 		}
-		s.writeJSON(w, http.StatusOK, cluster.ReplicateBatchResponse{AckSeq: ackSeq})
+		s.writeJSON(w, r, http.StatusOK, cluster.ReplicateBatchResponse{AckSeq: ackSeq})
 
 	case "/_internal/shard/search":
 		var req cluster.ShardSearchRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			s.writeESError(w, http.StatusBadRequest, "json_parse_exception", err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "json_parse_exception", err.Error())
 			return
 		}
 		hits, err := s.node.ExecuteLocalShardSearch(r.Context(), req)
 		if err != nil {
-			s.writeESError(w, http.StatusInternalServerError, "shard_search_error", err.Error())
+			s.writeESError(w, r, http.StatusInternalServerError, "shard_search_error", err.Error())
 			return
 		}
-		s.writeJSON(w, http.StatusOK, hits)
+		s.writeJSON(w, r, http.StatusOK, hits)
 
 	default:
-		s.writeESError(w, http.StatusNotFound, "no_such_route", path)
+		s.writeESError(w, r, http.StatusNotFound, "no_such_route", path)
 	}
 }
 
-func (s *Server) handleClusterHealth(w http.ResponseWriter) {
+func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 	nodes := s.node.Ring().Nodes()
 	indices := s.node.ListIndices()
 	activeShards := 0
 	for _, idx := range indices {
 		activeShards += idx.Settings.NumberOfShards * (1 + idx.Settings.NumberOfReplicas)
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
 		"cluster_name":       "cindersearch-cluster",
 		"status":             "green",
 		"number_of_nodes":    len(nodes),
@@ -208,7 +208,7 @@ func (s *Server) handleClusterHealth(w http.ResponseWriter) {
 	})
 }
 
-func (s *Server) handleCatIndices(w http.ResponseWriter) {
+func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 	indices := s.node.ListIndices()
 	out := make([]map[string]any, 0, len(indices))
 	for _, idx := range indices {
@@ -220,10 +220,10 @@ func (s *Server) handleCatIndices(w http.ResponseWriter) {
 			"rep":    idx.Settings.NumberOfReplicas,
 		})
 	}
-	s.writeJSON(w, http.StatusOK, out)
+	s.writeJSON(w, r, http.StatusOK, out)
 }
 
-func (s *Server) handleCatShards(w http.ResponseWriter) {
+func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 	indices := s.node.ListIndices()
 	var out []map[string]any
 	for _, idx := range indices {
@@ -250,7 +250,7 @@ func (s *Server) handleCatShards(w http.ResponseWriter) {
 			}
 		}
 	}
-	s.writeJSON(w, http.StatusOK, out)
+	s.writeJSON(w, r, http.StatusOK, out)
 }
 
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, indexName string) {
@@ -267,23 +267,23 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, index
 		Mappings: body.Mappings,
 	}
 	if err := s.node.CreateIndex(r.Context(), meta, true); err != nil {
-		s.writeESError(w, http.StatusBadRequest, "index_creation_exception", err.Error())
+		s.writeESError(w, r, http.StatusBadRequest, "index_creation_exception", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
 		"acknowledged":        true,
 		"shards_acknowledged": true,
 		"index":               indexName,
 	})
 }
 
-func (s *Server) handleGetIndex(w http.ResponseWriter, indexName string) {
+func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request, indexName string) {
 	meta, ok := s.node.GetIndex(indexName)
 	if !ok {
-		s.writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexName+"]")
+		s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexName+"]")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
 		indexName: map[string]any{
 			"mappings": meta.Mappings,
 			"settings": map[string]any{"index": meta.Settings},
@@ -293,10 +293,10 @@ func (s *Server) handleGetIndex(w http.ResponseWriter, indexName string) {
 
 func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request, indexName string) {
 	if err := s.node.DeleteIndex(r.Context(), indexName, true); err != nil {
-		s.writeESError(w, http.StatusInternalServerError, "index_delete_exception", err.Error())
+		s.writeESError(w, r, http.StatusInternalServerError, "index_delete_exception", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
 func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, docID string) {
@@ -305,17 +305,17 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 	case http.MethodPut, http.MethodPost:
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
-			s.writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "parse_exception", err.Error())
 			return
 		}
 		var check map[string]any
 		if err := json.Unmarshal(raw, &check); err != nil {
-			s.writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 			return
 		}
 		assignedID, shardID, crc, seq, err := s.node.IndexDoc(r.Context(), indexName, docID, raw, routing)
 		if err != nil {
-			s.writeESError(w, http.StatusInternalServerError, "index_failed_exception", err.Error())
+			s.writeESError(w, r, http.StatusInternalServerError, "index_failed_exception", err.Error())
 			return
 		}
 		status := http.StatusCreated
@@ -324,7 +324,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			status = http.StatusOK
 			result = "updated"
 		}
-		s.writeJSON(w, status, map[string]any{
+		s.writeJSON(w, r, status, map[string]any{
 			"_index":  indexName,
 			"_id":     assignedID,
 			"_shard":  shardID,
@@ -335,16 +335,16 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 
 	case http.MethodGet:
 		if docID == "" {
-			s.writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "document id required")
+			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required")
 			return
 		}
 		raw, found, crc, ptr, err := s.node.GetDoc(r.Context(), indexName, docID, routing)
 		if err != nil {
-			s.writeESError(w, http.StatusNotFound, "index_not_found_exception", err.Error())
+			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
 			return
 		}
 		if !found {
-			s.writeJSON(w, http.StatusNotFound, map[string]any{
+			s.writeJSON(w, r, http.StatusNotFound, map[string]any{
 				"_index": indexName,
 				"_id":    docID,
 				"found":  false,
@@ -361,19 +361,19 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 		if ptr != nil {
 			resp["_s3_pointer"] = ptr
 		}
-		s.writeJSON(w, http.StatusOK, resp)
+		s.writeJSON(w, r, http.StatusOK, resp)
 
 	case http.MethodDelete:
 		if docID == "" {
-			s.writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "document id required")
+			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required")
 			return
 		}
 		shardID, seq, err := s.node.DeleteDoc(r.Context(), indexName, docID, routing)
 		if err != nil {
-			s.writeESError(w, http.StatusNotFound, "index_not_found_exception", err.Error())
+			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{
+		s.writeJSON(w, r, http.StatusOK, map[string]any{
 			"_index":  indexName,
 			"_id":     docID,
 			"_shard":  shardID,
@@ -381,7 +381,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			"result":  "deleted",
 		})
 	default:
-		s.writeESError(w, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
+		s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
 	}
 }
 
@@ -390,7 +390,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request, indexNa
 		Doc map[string]any `json:"doc"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeESError(w, http.StatusBadRequest, "json_parse_exception", err.Error())
+		s.writeESError(w, r, http.StatusBadRequest, "json_parse_exception", err.Error())
 		return
 	}
 	routing := r.URL.Query().Get("routing")
@@ -403,15 +403,15 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request, indexNa
 	}
 	merged, err := json.Marshal(existing)
 	if err != nil {
-		s.writeESError(w, http.StatusInternalServerError, "json_marshal_exception", err.Error())
+		s.writeESError(w, r, http.StatusInternalServerError, "json_marshal_exception", err.Error())
 		return
 	}
 	assignedID, shardID, crc, seq, err := s.node.IndexDoc(r.Context(), indexName, docID, merged, routing)
 	if err != nil {
-		s.writeESError(w, http.StatusInternalServerError, "update_failed_exception", err.Error())
+		s.writeESError(w, r, http.StatusInternalServerError, "update_failed_exception", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
 		"_index":  indexName,
 		"_id":     assignedID,
 		"_shard":  shardID,
@@ -425,7 +425,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		s.writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+		s.writeESError(w, r, http.StatusBadRequest, "parse_exception", err.Error())
 		return
 	}
 
@@ -442,7 +442,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 		}
 		var actionLine map[string]map[string]any
 		if err := json.Unmarshal([]byte(line), &actionLine); err != nil {
-			s.writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "malformed bulk action line: "+err.Error())
+			s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "malformed bulk action line: "+err.Error())
 			return
 		}
 
@@ -467,7 +467,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 
 			case "index", "create", "update":
 				if !scanner.Scan() {
-					s.writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "missing document payload line after bulk action")
+					s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "missing document payload line after bulk action")
 					return
 				}
 				docBytes := append([]byte(nil), bytes.TrimSpace(scanner.Bytes())...)
@@ -505,7 +505,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 		}
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
 		"took":   time.Since(start).Milliseconds(),
 		"errors": hasErrors,
 		"items":  items,
@@ -518,7 +518,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, indexNames
 		raw, err := io.ReadAll(r.Body)
 		if err == nil && len(bytes.TrimSpace(raw)) > 0 {
 			if err := json.Unmarshal(raw, &req); err != nil {
-				s.writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+				s.writeESError(w, r, http.StatusBadRequest, "parsing_exception", err.Error())
 				return
 			}
 		}
@@ -555,20 +555,25 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, indexNames
 		if strings.Contains(err.Error(), "index_not_found_exception") {
 			status = http.StatusNotFound
 		}
-		s.writeESError(w, status, "search_phase_execution_exception", err.Error())
+		s.writeESError(w, r, status, "search_phase_execution_exception", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, resp)
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
-func (s *Server) writeJSON(w http.ResponseWriter, status int, payload any) {
+func (s *Server) writeJSON(w http.ResponseWriter, r *http.Request, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if r == nil || (!strings.HasPrefix(r.URL.Path, "/_internal/") && r.URL.Query().Get("pretty") != "false") {
+		enc.SetIndent("", "  ")
+	}
+	_ = enc.Encode(payload)
 }
 
-func (s *Server) writeESError(w http.ResponseWriter, status int, errType, reason string) {
-	s.writeJSON(w, status, map[string]any{
+func (s *Server) writeESError(w http.ResponseWriter, r *http.Request, status int, errType, reason string) {
+	s.writeJSON(w, r, status, map[string]any{
 		"error": map[string]any{
 			"root_cause": []map[string]any{{
 				"type":   errType,

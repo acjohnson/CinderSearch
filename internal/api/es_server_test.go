@@ -122,6 +122,27 @@ func TestESClusterInfoHealthCatAndIndexLifecycle(t *testing.T) {
 		t.Fatalf("unexpected version object: %+v", ver)
 	}
 
+	// Verify pretty-printed JSON by default (2-space indent) and compact with ?pretty=false
+	rawPrettyResp, err := http.Get(srvs[0].URL + "/")
+	if err != nil {
+		t.Fatalf("get pretty /: %v", err)
+	}
+	rawPrettyBytes, _ := io.ReadAll(rawPrettyResp.Body)
+	_ = rawPrettyResp.Body.Close()
+	if !strings.Contains(string(rawPrettyBytes), "\n  \"cluster_name\":") {
+		t.Fatalf("expected pretty-printed 2-space JSON by default, got:\n%s", string(rawPrettyBytes))
+	}
+
+	rawCompactResp, err := http.Get(srvs[0].URL + "/?pretty=false")
+	if err != nil {
+		t.Fatalf("get compact /: %v", err)
+	}
+	rawCompactBytes, _ := io.ReadAll(rawCompactResp.Body)
+	_ = rawCompactResp.Body.Close()
+	if strings.Contains(strings.TrimSpace(string(rawCompactBytes)), "\n") {
+		t.Fatalf("expected single-line JSON with ?pretty=false, got:\n%s", string(rawCompactBytes))
+	}
+
 	// 2. Create index on node-1 with explicit shards/replicas & mappings
 	code, created := doJSONReq(t, http.MethodPut, srvs[0].URL+"/events", `{
 		"settings": {"number_of_shards": 2, "number_of_replicas": 1},

@@ -100,6 +100,51 @@ func TestNVMeScrubAndOverwriteAccounting(t *testing.T) {
 	}
 }
 
+func TestNVMeCacheHasVerifyCRCAndGetRange(t *testing.T) {
+	c, err := NewNVMeCache(t.TempDir(), 1024*1024)
+	if err != nil {
+		t.Fatalf("new nvme cache: %v", err)
+	}
+
+	blob := []byte(`{"id":1}{"id":2}{"id":3}`)
+	crc := checksum.Sum32C(blob)
+	if err := c.Put("seg/packed.docs", blob, crc); err != nil {
+		t.Fatalf("put packed.docs: %v", err)
+	}
+
+	if !c.Has("seg/packed.docs") || c.Has("seg/missing.docs") {
+		t.Fatalf("unexpected Has results")
+	}
+
+	// Byte-range read for middle record {"id":2}
+	mid, hit, err := c.GetRange("seg/packed.docs", 8, 8)
+	if err != nil || !hit || string(mid) != `{"id":2}` {
+		t.Fatalf("unexpected GetRange result: hit=%v err=%v got=%q", hit, err, string(mid))
+	}
+
+	// Out-of-bounds range cleanly misses without panicking
+	if _, oobHit, _ := c.GetRange("seg/packed.docs", 8, 100); oobHit {
+		t.Fatalf("expected miss for out-of-bounds range")
+	}
+
+	// VerifyCRC passes on intact blob, detects bit-rot on corruption, and increments BitRotHealed
+	if ok, err := c.VerifyCRC("seg/packed.docs", crc); !ok || err != nil {
+		t.Fatalf("expected VerifyCRC pass, got ok=%v err=%v", ok, err)
+	}
+	if err := c.CorruptFileForTest("seg/packed.docs"); err != nil {
+		t.Fatalf("corrupt file: %v", err)
+	}
+	if ok, err := c.VerifyCRC("seg/packed.docs", crc); ok || err == nil {
+		t.Fatalf("expected VerifyCRC to detect bit-rot, got ok=%v err=%v", ok, err)
+	}
+	if c.Has("seg/packed.docs") {
+		t.Fatalf("expected corrupted entry purged after VerifyCRC failure")
+	}
+	if st := c.Stats(); st.BitRotHealed != 1 {
+		t.Fatalf("expected BitRotHealed=1 after VerifyCRC failure, got %+v", st)
+	}
+}
+
 func BenchmarkNVMeCachePut4KB(b *testing.B) {
 	c, err := NewNVMeCache(b.TempDir(), 64*1024*1024)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -110,6 +111,121 @@ func (c *NVMeCache) Get(key string) ([]byte, bool, error) {
 
 	c.hits.Add(1)
 	return data, true, nil
+}
+
+var verifyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+// Has reports whether key is currently tracked in cache and backed by a file on NVMe.
+func (c *NVMeCache) Has(key string) bool {
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	if !ok {
+		c.mu.Unlock()
+		return false
+	}
+	filePath := filepath.Join(c.dir, entry.fileName)
+	c.mu.Unlock()
+
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+// VerifyCRC verifies an NVMe cached file against expectedCRC using a pooled 32KB buffer
+// (zero heap allocation per check). On bit-rot it purges the entry and increments BitRotHealed.
+func (c *NVMeCache) VerifyCRC(key string, expectedCRC uint32) (bool, error) {
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	if !ok {
+		c.mu.Unlock()
+		return false, nil
+	}
+	filePath := filepath.Join(c.dir, entry.fileName)
+	if expectedCRC == 0 {
+		expectedCRC = entry.crc32c
+	}
+	c.lru.MoveToFront(entry.elem)
+	c.mu.Unlock()
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		c.removeEntry(key)
+		return false, nil
+	}
+	bufPtr := verifyBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	var actual uint32
+	for {
+		nr, readErr := f.Read(buf)
+		if nr > 0 {
+			actual = checksum.Update32C(actual, buf[:nr])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			verifyBufPool.Put(bufPtr)
+			_ = f.Close()
+			c.removeEntry(key)
+			c.bitRotHealed.Add(1)
+			return false, readErr
+		}
+	}
+	verifyBufPool.Put(bufPtr)
+	_ = f.Close()
+
+	if actual != expectedCRC {
+		c.removeEntry(key)
+		c.bitRotHealed.Add(1)
+		return false, fmt.Errorf("%w: expected 0x%08x, got 0x%08x", checksum.ErrMismatch, expectedCRC, actual)
+	}
+	c.hits.Add(1)
+	return true, nil
+}
+
+// GetRange reads only [offset, offset+length) bytes from an NVMe-cached blob, avoiding full-file I/O.
+// Callers verify the slice's per-doc CRC32C and call InvalidateCorrupted if corruption is detected.
+func (c *NVMeCache) GetRange(key string, offset, length int64) ([]byte, bool, error) {
+	if offset < 0 || length < 0 {
+		return nil, false, nil
+	}
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	if !ok || offset+length > entry.size {
+		c.mu.Unlock()
+		c.misses.Add(1)
+		return nil, false, nil
+	}
+	filePath := filepath.Join(c.dir, entry.fileName)
+	c.lru.MoveToFront(entry.elem)
+	c.mu.Unlock()
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		c.removeEntry(key)
+		c.misses.Add(1)
+		return nil, false, nil
+	}
+	buf := make([]byte, length)
+	_, err = f.ReadAt(buf, offset)
+	_ = f.Close()
+	if err != nil {
+		c.removeEntry(key)
+		c.misses.Add(1)
+		return nil, false, nil
+	}
+	c.hits.Add(1)
+	return buf, true, nil
+}
+
+// InvalidateCorrupted removes a corrupted NVMe entry and records a bit-rot heal event.
+func (c *NVMeCache) InvalidateCorrupted(key string) {
+	c.removeEntry(key)
+	c.bitRotHealed.Add(1)
 }
 
 // GetOrFetch checks the NVMe cache first and falls back to loader on cache miss or

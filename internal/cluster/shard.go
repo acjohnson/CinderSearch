@@ -47,6 +47,7 @@ type Shard struct {
 	indexName string
 	shardID   int
 	isPrimary bool
+	readOnly  bool
 
 	wal       *wal.WAL
 	nvmeCache *cache.NVMeCache
@@ -61,6 +62,11 @@ type Shard struct {
 
 	replicaAckSeq map[string]uint64 // peerNodeID -> last replicated WAL seq
 	lastWriteAt   atomic.Int64
+
+	segCacheMu         sync.RWMutex
+	decodedSegs        map[string]*segment.Segment // idxKey -> cached decoded immutable segment
+	committedLatestSeq map[string]uint64           // highest seq across committed segments
+	committedSeqSegCnt int                         // len(segments) when committedLatestSeq was built
 }
 
 // OpenShard initializes a shard's NVMe WAL, replays uncommitted frames into the NRT buffer,
@@ -89,6 +95,7 @@ func OpenShard(
 		s3:            s3,
 		memDocs:       make(map[string]wal.Record),
 		replicaAckSeq: make(map[string]uint64),
+		decodedSegs:   make(map[string]*segment.Segment),
 	}
 
 	// Load authoritative manifest from S3 if present.
@@ -123,9 +130,49 @@ func OpenShard(
 	return sh, nil
 }
 
+// OpenReadOnlyShard opens a stateless S3-backed shard view (no local NVMe WAL files) for reader nodes.
+func OpenReadOnlyShard(
+	ctx context.Context,
+	indexName string,
+	shardID int,
+	nvmeCache *cache.NVMeCache,
+	s3 *s3store.Client,
+) (*Shard, error) {
+	sh := &Shard{
+		indexName:     indexName,
+		shardID:       shardID,
+		isPrimary:     false,
+		readOnly:      true,
+		nvmeCache:     nvmeCache,
+		s3:            s3,
+		memDocs:       make(map[string]wal.Record),
+		replicaAckSeq: make(map[string]uint64),
+		decodedSegs:   make(map[string]*segment.Segment),
+	}
+
+	if s3 != nil {
+		mKey := manifestKey(indexName, shardID)
+		data, _, err := s3.GetObject(ctx, mKey)
+		if err == nil {
+			var man ShardManifest
+			if jsonErr := json.Unmarshal(data, &man); jsonErr == nil {
+				sh.flushedSeq = man.FlushedSeq
+				sh.segments = man.Segments
+				sh.segCounter = len(man.Segments)
+			}
+		} else if !errors.Is(err, s3store.ErrNotFound) {
+			return nil, fmt.Errorf("load readonly shard manifest: %w", err)
+		}
+	}
+	return sh, nil
+}
+
 // IndexLocal computes CRC32C on the fly, writes to the NVMe WAL for sub-ms durability,
 // and updates the NRT memtable for immediate availability.
 func (s *Shard) IndexLocal(docID string, rawJSON []byte) (wal.Record, error) {
+	if s.readOnly || s.wal == nil {
+		return wal.Record{}, fmt.Errorf("shard %s[%d] is read-only", s.indexName, s.shardID)
+	}
 	s.mu.Lock()
 	rec, err := s.wal.Append(wal.OpIndex, s.indexName, docID, rawJSON)
 	if err != nil {
@@ -141,6 +188,9 @@ func (s *Shard) IndexLocal(docID string, rawJSON []byte) (wal.Record, error) {
 
 // DeleteLocal appends a delete tombstone into the NVMe WAL.
 func (s *Shard) DeleteLocal(docID string) (wal.Record, error) {
+	if s.readOnly || s.wal == nil {
+		return wal.Record{}, fmt.Errorf("shard %s[%d] is read-only", s.indexName, s.shardID)
+	}
 	s.mu.Lock()
 	rec, err := s.wal.Append(wal.OpDelete, s.indexName, docID, nil)
 	if err != nil {
@@ -156,6 +206,9 @@ func (s *Shard) DeleteLocal(docID string) (wal.Record, error) {
 
 // ApplyReplicaRecords verifies CRC32C on replicated WAL frames and persists them locally.
 func (s *Shard) ApplyReplicaRecords(records []wal.Record) (uint64, error) {
+	if s.readOnly || s.wal == nil {
+		return 0, fmt.Errorf("shard %s[%d] is read-only", s.indexName, s.shardID)
+	}
 	var highSeq uint64
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -184,6 +237,9 @@ func (s *Shard) ApplyReplicaRecords(records []wal.Record) (uint64, error) {
 
 // PendingReplication returns WAL frames newer than afterSeq for async replica streaming.
 func (s *Shard) PendingReplication(afterSeq uint64) []wal.Record {
+	if s.wal == nil {
+		return nil
+	}
 	return s.wal.Since(afterSeq)
 }
 
@@ -232,6 +288,9 @@ func (s *Shard) rebuildMemSegLocked() error {
 // DocValues, and packed _source doc store), uploads it to S3 with CRC32C verification,
 // warms the local NVMe read cache, updates the S3 manifest, and compacts the WAL.
 func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
+	if s.readOnly || s.wal == nil {
+		return nil, nil
+	}
 	if s.s3 == nil {
 		return nil, fmt.Errorf("s3 client not configured")
 	}
@@ -298,6 +357,13 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 		CreatedAt:  time.Now().UTC().Unix(),
 	}
 
+	seg.DocsCRC32C = docsCRC
+	s.segCacheMu.Lock()
+	s.decodedSegs[idxKey] = seg
+	s.committedLatestSeq = nil
+	s.committedSeqSegCnt = 0
+	s.segCacheMu.Unlock()
+
 	s.mu.Lock()
 	s.segCounter = nextCounter
 	s.segments = append(s.segments, ref)
@@ -348,16 +414,28 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 // hydrated through the NVMe cache + any uncommitted NRT memtable segment), ordered newest-first.
 // It also returns tombstones newer than older segments so deleted/updated docs are suppressed.
 func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[string]uint64, error) {
-	s.mu.Lock()
-	if s.memDirty {
-		if err := s.rebuildMemSegLocked(); err != nil {
-			s.mu.Unlock()
-			return nil, nil, err
-		}
+	s.mu.RLock()
+	dirty := s.memDirty
+	var mem *segment.Segment
+	var refs []SegmentRef
+	if !dirty {
+		mem = s.memSeg
+		refs = append([]SegmentRef(nil), s.segments...)
 	}
-	mem := s.memSeg
-	refs := append([]SegmentRef(nil), s.segments...)
-	s.mu.Unlock()
+	s.mu.RUnlock()
+
+	if dirty {
+		s.mu.Lock()
+		if s.memDirty {
+			if err := s.rebuildMemSegLocked(); err != nil {
+				s.mu.Unlock()
+				return nil, nil, err
+			}
+		}
+		mem = s.memSeg
+		refs = append([]SegmentRef(nil), s.segments...)
+		s.mu.Unlock()
+	}
 
 	// Sync manifest from S3 if we are a replica or newly joined reader.
 	if s.s3 != nil && !s.isPrimary {
@@ -369,18 +447,40 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 				s.segments = man.Segments
 				s.flushedSeq = man.FlushedSeq
 				s.mu.Unlock()
+				s.segCacheMu.Lock()
+				s.committedLatestSeq = nil
+				s.committedSeqSegCnt = 0
+				s.segCacheMu.Unlock()
 			}
 		}
 	}
 
-	var out []*segment.Segment
+	out := make([]*segment.Segment, 0, len(refs)+1)
 	if mem != nil {
 		out = append(out, mem)
 	}
 
-	// Load committed S3 segments newest-first via NVMe read cache.
+	// Load committed S3 segments newest-first; reuse decoded immutable segments in memory
+	// while still performing zero-alloc CRC32C verification on the NVMe .idx file to catch bit-rot.
+	committedSegs := make([]*segment.Segment, 0, len(refs))
 	for i := len(refs) - 1; i >= 0; i-- {
 		ref := refs[i]
+
+		s.segCacheMu.RLock()
+		cachedSeg := s.decodedSegs[ref.IdxKey]
+		s.segCacheMu.RUnlock()
+
+		if cachedSeg != nil {
+			if s.nvmeCache == nil {
+				committedSegs = append(committedSegs, cachedSeg)
+				continue
+			}
+			if ok, vErr := s.nvmeCache.VerifyCRC(ref.IdxKey, ref.IdxCRC32C); ok && vErr == nil {
+				committedSegs = append(committedSegs, cachedSeg)
+				continue
+			}
+		}
+
 		var idxBytes []byte
 		var err error
 		if s.nvmeCache != nil {
@@ -398,21 +498,64 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 			return nil, nil, fmt.Errorf("decode segment %s: %w", ref.ID, err)
 		}
 		seg.DocsCRC32C = ref.DocsCRC32C
-		out = append(out, seg)
+
+		s.segCacheMu.Lock()
+		s.decodedSegs[ref.IdxKey] = seg
+		s.segCacheMu.Unlock()
+		committedSegs = append(committedSegs, seg)
+	}
+	out = append(out, committedSegs...)
+
+	// Track highest sequence per DocID across committed segments (cached) + memtable overlay.
+	var baseSeq map[string]uint64
+	if len(committedSegs) > 0 {
+		s.segCacheMu.RLock()
+		if s.committedLatestSeq != nil && s.committedSeqSegCnt == len(refs) {
+			baseSeq = s.committedLatestSeq
+		}
+		s.segCacheMu.RUnlock()
+
+		if baseSeq == nil {
+			built := make(map[string]uint64)
+			for _, seg := range committedSegs {
+				for docID, delSeq := range seg.Tombstones {
+					if delSeq > built[docID] {
+						built[docID] = delSeq
+					}
+				}
+				for _, dm := range seg.Docs {
+					if dm.Seq > built[dm.DocID] {
+						built[dm.DocID] = dm.Seq
+					}
+				}
+			}
+			s.segCacheMu.Lock()
+			s.committedLatestSeq = built
+			s.committedSeqSegCnt = len(refs)
+			s.segCacheMu.Unlock()
+			baseSeq = built
+		}
 	}
 
-	// Track highest sequence per DocID across segments + tombstones to suppress stale versions.
-	latestSeq := make(map[string]uint64)
-	for _, seg := range out {
-		for docID, delSeq := range seg.Tombstones {
-			if delSeq > latestSeq[docID] {
-				latestSeq[docID] = delSeq
-			}
+	if mem == nil {
+		if baseSeq == nil {
+			baseSeq = map[string]uint64{}
 		}
-		for _, dm := range seg.Docs {
-			if dm.Seq > latestSeq[dm.DocID] {
-				latestSeq[dm.DocID] = dm.Seq
-			}
+		return out, baseSeq, nil
+	}
+
+	latestSeq := make(map[string]uint64, len(baseSeq)+len(mem.Docs)+len(mem.Tombstones))
+	for k, v := range baseSeq {
+		latestSeq[k] = v
+	}
+	for docID, delSeq := range mem.Tombstones {
+		if delSeq > latestSeq[docID] {
+			latestSeq[docID] = delSeq
+		}
+	}
+	for _, dm := range mem.Docs {
+		if dm.Seq > latestSeq[dm.DocID] {
+			latestSeq[dm.DocID] = dm.Seq
 		}
 	}
 	return out, latestSeq, nil
@@ -428,42 +571,46 @@ func (s *Shard) ReadDocSource(ctx context.Context, seg *segment.Segment, docIdx 
 		}
 		return meta.RawJSON, true, nil
 	}
-
 	if seg.DocsObjectKey == "" {
 		return nil, false, fmt.Errorf("missing S3 object key for doc %s", meta.DocID)
 	}
+	return s.ReadDocSourceByMeta(ctx, seg.DocsObjectKey, meta.Offset, meta.Length, meta.CRC32C)
+}
 
-	// 1. Check NVMe cache for the packed .docs segment first.
+// ReadDocSourceByMeta fetches just [offset, offset+length) bytes for a single document from
+// local NVMe cache (via ReadAt byte-range) or S3 Range fallback, verifying per-doc CRC32C.
+func (s *Shard) ReadDocSourceByMeta(ctx context.Context, docsKey string, offset, length int64, crc32c uint32) (raw []byte, nvmeHit bool, err error) {
+	if docsKey == "" {
+		return nil, false, fmt.Errorf("missing S3 object key")
+	}
+
+	// 1. Check NVMe cache via byte-range ReadAt (avoids reading full .docs segment).
 	if s.nvmeCache != nil {
-		if blob, hit, cacheErr := s.nvmeCache.Get(seg.DocsObjectKey); hit && cacheErr == nil {
-			end := meta.Offset + meta.Length
-			if end <= int64(len(blob)) {
-				slice := blob[meta.Offset:end]
-				if err := checksum.Verify(slice, meta.CRC32C); err == nil {
-					return slice, true, nil
-				}
+		if slice, hit, cacheErr := s.nvmeCache.GetRange(docsKey, offset, length); hit && cacheErr == nil {
+			if err := checksum.Verify(slice, crc32c); err == nil {
+				return slice, true, nil
 			}
+			s.nvmeCache.InvalidateCorrupted(docsKey)
 		}
 	}
 
 	// 2. Fallback: HTTP Range fetch of just this document's bytes from S3 + verify CRC32C.
-	slice, err := s.s3.GetObjectRange(ctx, seg.DocsObjectKey, meta.Offset, meta.Offset+meta.Length-1)
+	slice, err := s.s3.GetObjectRange(ctx, docsKey, offset, offset+length-1)
 	if err != nil {
 		return nil, false, err
 	}
-	if err := checksum.Verify(slice, meta.CRC32C); err != nil {
+	if err := checksum.Verify(slice, crc32c); err != nil {
 		return nil, false, err
 	}
 	return slice, false, nil
 }
 
-// IsDocsCachedOnNVMe checks whether a segment's packed .docs object is currently intact in NVMe cache.
+// IsDocsCachedOnNVMe checks whether a segment's packed .docs object is currently tracked on NVMe.
 func (s *Shard) IsDocsCachedOnNVMe(docsKey string) bool {
 	if s.nvmeCache == nil || docsKey == "" {
 		return false
 	}
-	_, hit, err := s.nvmeCache.Get(docsKey)
-	return hit && err == nil
+	return s.nvmeCache.Has(docsKey)
 }
 
 // GetDocByID fetches the latest live document matching docID in this shard.
@@ -496,6 +643,7 @@ type ShardStats struct {
 	IndexName    string       `json:"index"`
 	ShardID      int          `json:"shard_id"`
 	IsPrimary    bool         `json:"is_primary"`
+	ReadOnly     bool         `json:"read_only,omitempty"`
 	WALLength    int          `json:"wal_buffered_ops"`
 	FlushedSeq   uint64       `json:"flushed_seq"`
 	SegmentCount int          `json:"s3_segments"`
@@ -506,11 +654,16 @@ type ShardStats struct {
 func (s *Shard) Stats() ShardStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	walLen := 0
+	if s.wal != nil {
+		walLen = s.wal.Len()
+	}
 	return ShardStats{
 		IndexName:    s.indexName,
 		ShardID:      s.shardID,
 		IsPrimary:    s.isPrimary,
-		WALLength:    s.wal.Len(),
+		ReadOnly:     s.readOnly,
+		WALLength:    walLen,
 		FlushedSeq:   s.flushedSeq,
 		SegmentCount: len(s.segments),
 		Segments:     append([]SegmentRef(nil), s.segments...),
@@ -531,6 +684,9 @@ func (s *Shard) SortedSegmentIDs() []string {
 
 // Close closes the shard's WAL handle.
 func (s *Shard) Close() error {
+	if s.wal == nil {
+		return nil
+	}
 	return s.wal.Close()
 }
 

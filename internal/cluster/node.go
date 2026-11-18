@@ -41,15 +41,16 @@ const (
 
 // NodeConfig configures a CinderSearch cluster node.
 type NodeConfig struct {
-	NodeID           string
-	AdvertiseAddress string
-	NVMeDir          string
-	NVMeMaxBytes     int64
-	FlushInterval    time.Duration
+	NodeID            string
+	Roles             []string // Supported: data (default), coordinator, reader
+	AdvertiseAddress  string
+	NVMeDir           string
+	NVMeMaxBytes      int64
+	FlushInterval     time.Duration
 	ReplicateInterval time.Duration
-	ScrubInterval    time.Duration
-	S3               *s3store.Client
-	Peers            []sharding.NodeInfo
+	ScrubInterval     time.Duration
+	S3                *s3store.Client
+	Peers             []sharding.NodeInfo
 }
 
 // IndexSettings mirrors Elasticsearch index creation settings.
@@ -93,12 +94,13 @@ type ReplicateBatchResponse struct {
 
 // ShardSearchRequest executes a Query DSL evaluation on a single target shard.
 type ShardSearchRequest struct {
-	IndexName string         `json:"index_name"`
-	ShardID   int            `json:"shard_id"`
-	Query     map[string]any `json:"query"`
-	Mode      RetrievalMode  `json:"mode"`
-	NeedAggs  bool           `json:"need_aggs"`
-	NeedSort  bool           `json:"need_sort"`
+	IndexName   string         `json:"index_name"`
+	ShardID     int            `json:"shard_id"`
+	Query       map[string]any `json:"query"`
+	Mode        RetrievalMode  `json:"mode"`
+	NeedAggs    bool           `json:"need_aggs"`
+	NeedSort    bool           `json:"need_sort"`
+	DeferSource bool           `json:"defer_source,omitempty"`
 }
 
 // ShardSearchHit carries a shard-local matched hit back to the coordinator.
@@ -136,11 +138,17 @@ type Node struct {
 	wg         sync.WaitGroup
 }
 
-// NewNode initializes a CinderSearch node, its NVMe cache, consistent hash ring, and background workers.
+// NewNode initializes a CinderSearch node, its NVMe cache, cluster ring, and role-appropriate background workers.
 func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = "node-1"
 	}
+	roles, err := sharding.NormalizeRoles(cfg.Roles)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Roles = roles
+
 	if cfg.NVMeDir == "" {
 		cfg.NVMeDir = filepath.Join(os.TempDir(), "cindersearch-"+cfg.NodeID)
 	}
@@ -162,18 +170,22 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, err
 	}
 
-	peers := append([]sharding.NodeInfo(nil), cfg.Peers...)
+	peers := make([]sharding.NodeInfo, 0, len(cfg.Peers)+1)
 	selfIncluded := false
-	for _, p := range peers {
+	for _, p := range cfg.Peers {
 		if p.ID == cfg.NodeID {
+			if len(p.Roles) == 0 {
+				p.Roles = cfg.Roles
+			}
 			selfIncluded = true
-			break
 		}
+		peers = append(peers, p)
 	}
 	if !selfIncluded {
 		peers = append(peers, sharding.NodeInfo{
 			ID:      cfg.NodeID,
 			Address: cfg.AdvertiseAddress,
+			Roles:   cfg.Roles,
 		})
 	}
 
@@ -190,10 +202,15 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		stopCh:  make(chan struct{}),
 	}
 
-	n.wg.Add(3)
-	go n.replicationLoop()
-	go n.flushLoop()
-	go n.scrubLoop()
+	if n.HasRole(sharding.RoleData) {
+		n.wg.Add(2)
+		go n.replicationLoop()
+		go n.flushLoop()
+	}
+	if n.HasRole(sharding.RoleData) || n.HasRole(sharding.RoleReader) {
+		n.wg.Add(1)
+		go n.scrubLoop()
+	}
 
 	return n, nil
 }
@@ -201,6 +218,21 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 // ID returns the node identifier.
 func (n *Node) ID() string {
 	return n.cfg.NodeID
+}
+
+// Roles returns the normalized roles assigned to this node.
+func (n *Node) Roles() []string {
+	return append([]string(nil), n.cfg.Roles...)
+}
+
+// HasRole reports whether this node holds the specified role.
+func (n *Node) HasRole(role string) bool {
+	for _, r := range n.cfg.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
 }
 
 // Ring returns the node's consistent hash ring.
@@ -270,7 +302,10 @@ func (n *Node) CreateIndex(ctx context.Context, meta IndexMetadata, broadcast bo
 	return nil
 }
 
-// ApplyIndexMetadata registers index metadata on this node and opens local primary/replica shards.
+// ApplyIndexMetadata registers index metadata on this node and opens role-appropriate shards:
+// - data: WAL-backed primary/replica shards owned by this node
+// - reader: stateless read-only S3 shard views for all shards (zero WAL)
+// - coordinator: metadata only (zero local shards)
 func (n *Node) ApplyIndexMetadata(ctx context.Context, meta IndexMetadata) error {
 	placements, err := n.ring.AllPlacements(meta.Name, meta.Settings.NumberOfShards, meta.Settings.NumberOfReplicas)
 	if err != nil {
@@ -284,33 +319,54 @@ func (n *Node) ApplyIndexMetadata(ctx context.Context, meta IndexMetadata) error
 	}
 	n.mu.Unlock()
 
-	for _, p := range placements {
-		isPrimary := p.Primary.ID == n.cfg.NodeID
-		isReplica := false
-		for _, rep := range p.Replicas {
-			if rep.ID == n.cfg.NodeID {
-				isReplica = true
-				break
+	if n.HasRole(sharding.RoleData) {
+		for _, p := range placements {
+			isPrimary := p.Primary.ID == n.cfg.NodeID
+			isReplica := false
+			for _, rep := range p.Replicas {
+				if rep.ID == n.cfg.NodeID {
+					isReplica = true
+					break
+				}
 			}
-		}
-		if !isPrimary && !isReplica {
-			continue
-		}
+			if !isPrimary && !isReplica {
+				continue
+			}
 
-		n.mu.RLock()
-		_, exists := n.shards[meta.Name][p.ShardID]
-		n.mu.RUnlock()
-		if exists {
-			continue
-		}
+			n.mu.RLock()
+			_, exists := n.shards[meta.Name][p.ShardID]
+			n.mu.RUnlock()
+			if exists {
+				continue
+			}
 
-		sh, err := OpenShard(ctx, meta.Name, p.ShardID, isPrimary, n.cfg.NVMeDir, n.nvmeCache, n.s3)
-		if err != nil {
-			return err
+			sh, err := OpenShard(ctx, meta.Name, p.ShardID, isPrimary, n.cfg.NVMeDir, n.nvmeCache, n.s3)
+			if err != nil {
+				return err
+			}
+			n.mu.Lock()
+			n.shards[meta.Name][p.ShardID] = sh
+			n.mu.Unlock()
 		}
-		n.mu.Lock()
-		n.shards[meta.Name][p.ShardID] = sh
-		n.mu.Unlock()
+		return nil
+	}
+
+	if n.HasRole(sharding.RoleReader) {
+		for _, p := range placements {
+			n.mu.RLock()
+			_, exists := n.shards[meta.Name][p.ShardID]
+			n.mu.RUnlock()
+			if exists {
+				continue
+			}
+			sh, err := OpenReadOnlyShard(ctx, meta.Name, p.ShardID, n.nvmeCache, n.s3)
+			if err != nil {
+				return err
+			}
+			n.mu.Lock()
+			n.shards[meta.Name][p.ShardID] = sh
+			n.mu.Unlock()
+		}
 	}
 	return nil
 }
@@ -492,11 +548,12 @@ func (n *Node) GetDoc(ctx context.Context, indexName, docID, routing string) ([]
 		return n.getLocalDoc(ctx, indexName, shardID, docID)
 	}
 
-	// Check if this node holds a replica locally first for fast reads.
+	// Check if this node holds a WAL-backed replica locally first for fast reads
+	// (skip readOnly shards here so NRT reads hit the primary WAL before S3 flush).
 	n.mu.RLock()
 	localReplica := n.shards[indexName][shardID]
 	n.mu.RUnlock()
-	if localReplica != nil {
+	if localReplica != nil && !localReplica.readOnly {
 		return n.getLocalDoc(ctx, indexName, shardID, docID)
 	}
 
@@ -614,6 +671,12 @@ func (n *Node) ApplyReplicaBatch(ctx context.Context, req ReplicateBatchRequest)
 
 // Search executes a distributed Elasticsearch Query DSL request across all shards of indexNames.
 func (n *Node) Search(ctx context.Context, indexNames []string, req query.SearchRequest, mode RetrievalMode) (map[string]any, error) {
+	return n.SearchWithPreference(ctx, indexNames, req, mode, false)
+}
+
+// SearchWithPreference executes distributed search, optionally routing shard reads to stateless
+// reader-role nodes first (falling back to data nodes if no readers are available).
+func (n *Node) SearchWithPreference(ctx context.Context, indexNames []string, req query.SearchRequest, mode RetrievalMode, preferReader bool) (map[string]any, error) {
 	start := time.Now()
 	if mode == "" {
 		mode = RetrievalDropIn
@@ -663,14 +726,15 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 		go func(indexName string, p sharding.Placement) {
 			defer wg.Done()
 			sReq := ShardSearchRequest{
-				IndexName: indexName,
-				ShardID:   p.ShardID,
-				Query:     req.Query,
-				Mode:      mode,
-				NeedAggs:  needAggs,
-				NeedSort:  needSort,
+				IndexName:   indexName,
+				ShardID:     p.ShardID,
+				Query:       req.Query,
+				Mode:        mode,
+				NeedAggs:    needAggs,
+				NeedSort:    needSort,
+				DeferSource: true,
 			}
-			hits, err := n.executeShardSearchWithFailover(ctx, p, sReq)
+			hits, err := n.executeShardSearchWithFailover(ctx, p, sReq, preferReader)
 			resCh <- shardResult{hits: hits, err: err}
 		}(ts.index, ts.p)
 	}
@@ -697,38 +761,54 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 		return nil, firstErr
 	}
 
-	// Build temporary DocRefs so query.CompareDocRefs & query.ComputeAggregations work uniformly across shards.
-	docRefs := make([]query.DocRef, len(allHits))
-	for i, h := range allHits {
-		pseudoSeg := &segment.Segment{
-			Docs:    []segment.DocMeta{{DocID: h.DocID, Seq: h.Seq}},
-			DocVals: []segment.DocValues{h.DocVals},
-		}
-		docRefs[i] = query.DocRef{
-			Seg:    pseudoSeg,
-			DocIdx: 0,
-			Score:  h.Score,
-		}
-	}
-
-	// Compute global aggregations across all matched docs prior to pagination.
 	var aggsOut map[string]any
-	if needAggs {
-		var err error
-		aggsOut, err = query.ComputeAggregations(docRefs, aggsSpec)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Sort using paired indices so allHits stays aligned with docRefs.
 	order := make([]int, len(allHits))
 	for i := range order {
 		order[i] = i
 	}
-	sort.Slice(order, func(i, j int) bool {
-		return query.CompareDocRefs(docRefs[order[i]], docRefs[order[j]], sortSpecs) < 0
-	})
+
+	if needAggs || needSort {
+		// Pack all hits into a single shared pseudo-Segment to avoid per-hit heap allocations.
+		pseudoSeg := &segment.Segment{
+			Docs:    make([]segment.DocMeta, len(allHits)),
+			DocVals: make([]segment.DocValues, len(allHits)),
+		}
+		docRefs := make([]query.DocRef, len(allHits))
+		for i, h := range allHits {
+			pseudoSeg.Docs[i] = segment.DocMeta{DocID: h.DocID, Seq: h.Seq}
+			pseudoSeg.DocVals[i] = h.DocVals
+			docRefs[i] = query.DocRef{
+				Seg:    pseudoSeg,
+				DocIdx: uint32(i),
+				Score:  h.Score,
+			}
+		}
+
+		// Compute global aggregations across all matched docs prior to pagination.
+		if needAggs {
+			var err error
+			aggsOut, err = query.ComputeAggregations(docRefs, aggsSpec)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		sort.Slice(order, func(i, j int) bool {
+			return query.CompareDocRefs(docRefs[order[i]], docRefs[order[j]], sortSpecs) < 0
+		})
+	} else if len(order) > 1 {
+		scoreDesc := len(sortSpecs) == 0 || sortSpecs[0].Desc
+		sort.Slice(order, func(i, j int) bool {
+			hi, hj := allHits[order[i]], allHits[order[j]]
+			if hi.Score != hj.Score {
+				if scoreDesc {
+					return hi.Score > hj.Score
+				}
+				return hi.Score < hj.Score
+			}
+			return hi.DocID < hj.DocID
+		})
+	}
 
 	var maxScore any = nil
 	if len(order) > 0 {
@@ -757,6 +837,18 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 	esHits := make([]map[string]any, 0, end-from)
 	for _, idx := range order[from:end] {
 		h := allHits[idx]
+
+		// Lazy-fetch _source ONLY for the paginated winning hits (avoiding reading thousands of non-returned docs).
+		includeSource := sourceSpec.Enabled && (mode == RetrievalDropIn || h.DocsKey == "" || (mode == RetrievalHybrid && h.NVMeCached))
+		if includeSource && len(h.RawJSON) == 0 && h.DocsKey != "" {
+			raw, nvmeHit, err := n.readHitSource(ctx, h)
+			if err != nil {
+				return nil, err
+			}
+			h.RawJSON = raw
+			h.NVMeCached = nvmeHit
+		}
+
 		item := map[string]any{
 			"_index":  h.Index,
 			"_id":     h.DocID,
@@ -780,9 +872,6 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 			}
 		}
 
-		// Attach _source when in dropin mode, or when doc is still only in NVMe WAL,
-		// or in hybrid mode when hot in NVMe cache.
-		includeSource := sourceSpec.Enabled && (mode == RetrievalDropIn || h.DocsKey == "" || (mode == RetrievalHybrid && h.NVMeCached))
 		if includeSource && len(h.RawJSON) > 0 {
 			item["_source"] = query.FilterSource(h.RawJSON, sourceSpec)
 		}
@@ -813,8 +902,29 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 	return resp, nil
 }
 
-func (n *Node) executeShardSearchWithFailover(ctx context.Context, p sharding.Placement, sReq ShardSearchRequest) ([]ShardSearchHit, error) {
-	candidates := append([]sharding.NodeInfo{p.Primary}, p.Replicas...)
+func (n *Node) executeShardSearchWithFailover(ctx context.Context, p sharding.Placement, sReq ShardSearchRequest, preferReader bool) ([]ShardSearchHit, error) {
+	dataOwners := make([]sharding.NodeInfo, 0, 1+len(p.Replicas))
+	dataOwners = append(dataOwners, p.Primary)
+	dataOwners = append(dataOwners, p.Replicas...)
+
+	readers := n.ring.ReaderNodes()
+	var rotatedReaders []sharding.NodeInfo
+	if len(readers) > 0 {
+		start := sReq.ShardID % len(readers)
+		rotatedReaders = make([]sharding.NodeInfo, 0, len(readers))
+		rotatedReaders = append(rotatedReaders, readers[start:]...)
+		rotatedReaders = append(rotatedReaders, readers[:start]...)
+	}
+
+	candidates := make([]sharding.NodeInfo, 0, len(dataOwners)+len(rotatedReaders))
+	if preferReader && len(rotatedReaders) > 0 {
+		candidates = append(candidates, rotatedReaders...)
+		candidates = append(candidates, dataOwners...)
+	} else {
+		candidates = append(candidates, dataOwners...)
+		candidates = append(candidates, rotatedReaders...)
+	}
+
 	var lastErr error
 	for _, owner := range candidates {
 		if owner.ID == n.cfg.NodeID {
@@ -841,6 +951,37 @@ func (n *Node) executeShardSearchWithFailover(ctx context.Context, p sharding.Pl
 	return nil, lastErr
 }
 
+func (n *Node) readHitSource(ctx context.Context, h ShardSearchHit) ([]byte, bool, error) {
+	n.mu.RLock()
+	var sh *Shard
+	if m := n.shards[h.Index]; m != nil {
+		sh = m[h.ShardID]
+	}
+	n.mu.RUnlock()
+	if sh != nil {
+		return sh.ReadDocSourceByMeta(ctx, h.DocsKey, h.Offset, h.Length, h.CRC32C)
+	}
+	if n.nvmeCache != nil {
+		if slice, hit, cacheErr := n.nvmeCache.GetRange(h.DocsKey, h.Offset, h.Length); hit && cacheErr == nil {
+			if checksum.Verify(slice, h.CRC32C) == nil {
+				return slice, true, nil
+			}
+			n.nvmeCache.InvalidateCorrupted(h.DocsKey)
+		}
+	}
+	if n.s3 == nil {
+		return nil, false, fmt.Errorf("s3 client not configured")
+	}
+	slice, err := n.s3.GetObjectRange(ctx, h.DocsKey, h.Offset, h.Offset+h.Length-1)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := checksum.Verify(slice, h.CRC32C); err != nil {
+		return nil, false, err
+	}
+	return slice, false, nil
+}
+
 // ExecuteLocalShardSearch evaluates Query DSL against all segments in a local shard.
 func (n *Node) ExecuteLocalShardSearch(ctx context.Context, sReq ShardSearchRequest) ([]ShardSearchHit, error) {
 	n.mu.RLock()
@@ -854,26 +995,43 @@ func (n *Node) ExecuteLocalShardSearch(ctx context.Context, sReq ShardSearchRequ
 	if err != nil {
 		return nil, err
 	}
+	if len(segs) == 0 {
+		return nil, nil
+	}
 
-	seen := make(map[string]struct{})
+	singleSeg := len(segs) == 1
+	var seen map[string]struct{}
+	if !singleSeg {
+		seen = make(map[string]struct{})
+	}
 	var out []ShardSearchHit
 
-	for _, seg := range segs {
+	for segIdx, seg := range segs {
 		segHits, err := query.EvaluateSegment(seg, sReq.Query)
 		if err != nil {
 			return nil, err
 		}
-		docsCached := sh.IsDocsCachedOnNVMe(seg.DocsObjectKey)
+		if len(segHits) == 0 {
+			continue
+		}
+		if segIdx == 0 && out == nil {
+			out = make([]ShardSearchHit, 0, len(segHits))
+		}
+		docsCached := seg.DocsObjectKey == "" || sh.IsDocsCachedOnNVMe(seg.DocsObjectKey)
+		needSource := sReq.Mode == RetrievalDropIn || seg.DocsObjectKey == "" || (sReq.Mode == RetrievalHybrid && docsCached)
+		eagerSource := needSource && (!sReq.DeferSource || seg.DocsObjectKey == "")
 
 		for _, h := range segHits {
 			dm := seg.Docs[h.DocIdx]
-			if dm.Seq < latestSeq[dm.DocID] {
-				continue
+			if !singleSeg {
+				if dm.Seq < latestSeq[dm.DocID] {
+					continue
+				}
+				if _, ok := seen[dm.DocID]; ok {
+					continue
+				}
+				seen[dm.DocID] = struct{}{}
 			}
-			if _, ok := seen[dm.DocID]; ok {
-				continue
-			}
-			seen[dm.DocID] = struct{}{}
 
 			hit := ShardSearchHit{
 				Index:      sReq.IndexName,
@@ -885,13 +1043,12 @@ func (n *Node) ExecuteLocalShardSearch(ctx context.Context, sReq ShardSearchRequ
 				Offset:     dm.Offset,
 				Length:     dm.Length,
 				CRC32C:     dm.CRC32C,
-				NVMeCached: docsCached || seg.DocsObjectKey == "",
+				NVMeCached: docsCached,
 			}
 			if sReq.NeedAggs || sReq.NeedSort {
 				hit.DocVals = seg.DocVals[h.DocIdx]
 			}
-			needSource := sReq.Mode == RetrievalDropIn || seg.DocsObjectKey == "" || (sReq.Mode == RetrievalHybrid && docsCached)
-			if needSource {
+			if eagerSource {
 				raw, nvmeHit, err := sh.ReadDocSource(ctx, seg, h.DocIdx)
 				if err != nil {
 					return nil, err
@@ -907,6 +1064,8 @@ func (n *Node) ExecuteLocalShardSearch(ctx context.Context, sReq ShardSearchRequ
 
 // ReplicationStats reports async WAL replication and S3 flush diagnostics.
 type ReplicationStats struct {
+	NodeID                 string       `json:"node_id"`
+	Roles                  []string     `json:"roles"`
 	ReplicationBatchesSent int64        `json:"replication_batches_sent"`
 	ReplicationErrors      int64        `json:"replication_errors"`
 	S3SegmentFlushes       int64        `json:"s3_segment_flushes"`
@@ -932,6 +1091,8 @@ func (n *Node) Stats() ReplicationStats {
 	})
 
 	return ReplicationStats{
+		NodeID:                 n.cfg.NodeID,
+		Roles:                  n.Roles(),
 		ReplicationBatchesSent: n.repSuccess.Load(),
 		ReplicationErrors:      n.repErrors.Load(),
 		S3SegmentFlushes:       n.flushes.Load(),

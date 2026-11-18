@@ -37,6 +37,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, r, http.StatusOK, map[string]any{
 			"name":         s.node.ID(),
 			"cluster_name": "cindersearch-cluster",
+			"roles":        s.node.Roles(),
 			"tagline":      "You Know, for Search (CinderSearch S3+NVMe Engine)",
 			"version": map[string]any{
 				"number":         "8.11.0",
@@ -58,6 +59,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/_cluster/health" && r.Method == http.MethodGet:
 		s.handleClusterHealth(w, r)
+		return
+	case path == "/_nodes" && r.Method == http.MethodGet:
+		s.handleNodes(w, r)
+		return
+	case path == "/_cat/nodes" && r.Method == http.MethodGet:
+		s.handleCatNodes(w, r)
 		return
 	case path == "/_cat/indices" && r.Method == http.MethodGet:
 		s.handleCatIndices(w, r)
@@ -192,20 +199,63 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, path str
 
 func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
 	nodes := s.node.Ring().Nodes()
+	dataNodes := s.node.Ring().DataNodes()
 	indices := s.node.ListIndices()
 	activeShards := 0
 	for _, idx := range indices {
 		activeShards += idx.Settings.NumberOfShards * (1 + idx.Settings.NumberOfReplicas)
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{
-		"cluster_name":       "cindersearch-cluster",
-		"status":             "green",
-		"number_of_nodes":    len(nodes),
-		"active_shards":      activeShards,
-		"number_of_indices":  len(indices),
-		"storage_backend":    "s3+nvme",
-		"checksum_algorithm": "crc32c",
+		"cluster_name":         "cindersearch-cluster",
+		"status":               "green",
+		"number_of_nodes":      len(nodes),
+		"number_of_data_nodes": len(dataNodes),
+		"active_shards":        activeShards,
+		"number_of_indices":    len(indices),
+		"storage_backend":      "s3+nvme",
+		"checksum_algorithm":   "crc32c",
 	})
+}
+
+func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	nodes := s.node.Ring().Nodes()
+	nodeMap := make(map[string]any, len(nodes))
+	for _, n := range nodes {
+		nodeMap[n.ID] = map[string]any{
+			"name":              n.ID,
+			"transport_address": n.Address,
+			"roles":             n.NormalizedRoles(),
+		}
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
+		"_nodes": map[string]any{
+			"total":      len(nodes),
+			"successful": len(nodes),
+			"failed":     0,
+		},
+		"cluster_name": "cindersearch-cluster",
+		"nodes":        nodeMap,
+	})
+}
+
+func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
+	nodes := s.node.Ring().Nodes()
+	out := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		var short strings.Builder
+		for _, role := range n.NormalizedRoles() {
+			if len(role) > 0 {
+				short.WriteByte(role[0])
+			}
+		}
+		out = append(out, map[string]any{
+			"name":      n.ID,
+			"address":   n.Address,
+			"roles":     n.NormalizedRoles(),
+			"node.role": short.String(),
+		})
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
 }
 
 func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
@@ -549,7 +599,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, indexNames
 		mode = cluster.RetrievalDropIn
 	}
 
-	resp, err := s.node.Search(r.Context(), indexNames, req, mode)
+	preferReader := strings.EqualFold(r.URL.Query().Get("preference"), "reader") ||
+		strings.EqualFold(r.Header.Get("X-Cinder-Preference"), "reader")
+
+	resp, err := s.node.SearchWithPreference(r.Context(), indexNames, req, mode, preferReader)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "index_not_found_exception") {

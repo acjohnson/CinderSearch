@@ -72,9 +72,10 @@ func printUsage() {
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	nodeID := fs.String("node-id", "node-1", "Cluster node identifier")
+	rolesFlag := fs.String("roles", "data", "Comma-separated node roles: data, coordinator, reader")
 	listenAddr := fs.String("listen", ":9200", "HTTP listen address")
 	pprofAddr := fs.String("pprof", "127.0.0.1:6060", "Optional pprof HTTP debug address (empty to disable)")
-	peersFlag := fs.String("peers", "", "Comma-separated peer specs id=host:port")
+	peersFlag := fs.String("peers", "", "Comma-separated peer specs id=host:port[@role1+role2]")
 	s3Endpoint := fs.String("s3-endpoint", "", "S3-compatible endpoint URL (AWS S3 or MinIO)")
 	s3Bucket := fs.String("s3-bucket", "cindersearch", "S3 bucket name")
 	s3Region := fs.String("s3-region", "us-east-1", "S3 region")
@@ -85,6 +86,11 @@ func runServe(args []string) {
 	nvmeMaxMB := fs.Int64("nvme-max-mb", 512, "Max local NVMe read cache size in MB")
 	flushSec := fs.Int("flush-sec", 5, "Background WAL-to-S3 segment flush interval in seconds")
 	_ = fs.Parse(args)
+
+	roles, err := sharding.NormalizeRoles(strings.Split(*rolesFlag, ","))
+	if err != nil {
+		log.Fatalf("invalid --roles: %v", err)
+	}
 
 	var mockS3 *s3store.MockServer
 	endpoint := *s3Endpoint
@@ -116,13 +122,27 @@ func runServe(args []string) {
 		for _, item := range strings.Split(*peersFlag, ",") {
 			kv := strings.SplitN(strings.TrimSpace(item), "=", 2)
 			if len(kv) == 2 {
-				peers = append(peers, sharding.NodeInfo{ID: kv[0], Address: kv[1]})
+				addrAndRoles := strings.SplitN(kv[1], "@", 2)
+				var peerRoles []string
+				if len(addrAndRoles) == 2 && addrAndRoles[1] != "" {
+					parsed, rErr := sharding.NormalizeRoles(strings.Split(addrAndRoles[1], "+"))
+					if rErr != nil {
+						log.Fatalf("invalid peer %q roles: %v", kv[0], rErr)
+					}
+					peerRoles = parsed
+				}
+				peers = append(peers, sharding.NodeInfo{
+					ID:      kv[0],
+					Address: addrAndRoles[0],
+					Roles:   peerRoles,
+				})
 			}
 		}
 	}
 
 	node, err := cluster.NewNode(cluster.NodeConfig{
 		NodeID:           *nodeID,
+		Roles:            roles,
 		AdvertiseAddress: *listenAddr,
 		NVMeDir:          *nvmeDir,
 		NVMeMaxBytes:     *nvmeMaxMB * 1024 * 1024,
@@ -140,7 +160,7 @@ func runServe(args []string) {
 		Handler: api.NewHandler(node),
 	}
 
-	log.Println(api.FormatEndpointBanner(*nodeID, *listenAddr, endpoint))
+	log.Printf("%s roles=%s", api.FormatEndpointBanner(*nodeID, *listenAddr, endpoint), strings.Join(node.Roles(), ","))
 
 	var pprofSrv *http.Server
 	if *pprofAddr != "" {

@@ -118,6 +118,10 @@ func TestESClusterInfoHealthCatAndIndexLifecycle(t *testing.T) {
 	if code != http.StatusOK || root["cluster_name"] != "cindersearch-cluster" {
 		t.Fatalf("unexpected root banner: code=%d body=%+v", code, root)
 	}
+	rolesArr, ok := root["roles"].([]any)
+	if !ok || len(rolesArr) != 1 || rolesArr[0] != sharding.RoleData {
+		t.Fatalf("unexpected root roles: %+v", root["roles"])
+	}
 	ver := root["version"].(map[string]any)
 	if ver["number"] != "8.11.0" || ver["engine"] != "cindersearch-go" {
 		t.Fatalf("unexpected version object: %+v", ver)
@@ -159,13 +163,31 @@ func TestESClusterInfoHealthCatAndIndexLifecycle(t *testing.T) {
 		t.Fatalf("expected synced index metadata on node-2: code=%d body=%+v", code, gotIdx)
 	}
 
-	// 4. Cluster health & _cat endpoints
+	// 4. Cluster health, _nodes, & _cat endpoints
 	code, health := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_cluster/health", "", nil)
-	if code != http.StatusOK || health["status"] != "green" || int(health["number_of_nodes"].(float64)) != 2 {
+	if code != http.StatusOK || health["status"] != "green" ||
+		int(health["number_of_nodes"].(float64)) != 2 ||
+		int(health["number_of_data_nodes"].(float64)) != 2 {
 		t.Fatalf("unexpected cluster health: code=%d body=%+v", code, health)
 	}
 
-	resp, err := http.Get(srvs[0].URL + "/_cat/indices")
+	code, nodesInfo := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_nodes", "", nil)
+	if code != http.StatusOK || int(nodesInfo["_nodes"].(map[string]any)["total"].(float64)) != 2 {
+		t.Fatalf("unexpected _nodes response: code=%d body=%+v", code, nodesInfo)
+	}
+
+	resp, err := http.Get(srvs[0].URL + "/_cat/nodes")
+	if err != nil {
+		t.Fatalf("get _cat/nodes: %v", err)
+	}
+	var catNodes []map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&catNodes)
+	_ = resp.Body.Close()
+	if len(catNodes) != 2 || catNodes[0]["node.role"] != "d" {
+		t.Fatalf("unexpected _cat/nodes: %+v", catNodes)
+	}
+
+	resp, err = http.Get(srvs[0].URL + "/_cat/indices")
 	if err != nil {
 		t.Fatalf("get _cat/indices: %v", err)
 	}

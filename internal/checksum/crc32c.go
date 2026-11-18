@@ -20,6 +20,11 @@ func Sum32C(data []byte) uint32 {
 	return crc32.Checksum(data, castagnoliTable)
 }
 
+// Update32C incrementally updates a running Castagnoli CRC32C digest with data.
+func Update32C(crc uint32, data []byte) uint32 {
+	return crc32.Update(crc, castagnoliTable, data)
+}
+
 // Verify checks data against an expected CRC32C digest, returning ErrMismatch if corrupted.
 func Verify(data []byte, expected uint32) error {
 	actual := Sum32C(data)

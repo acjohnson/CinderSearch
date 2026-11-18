@@ -587,3 +587,173 @@ func TestConcurrentIngestFlushAndSearchRaceSafe(t *testing.T) {
 		t.Fatalf("expected 60 total docs after concurrent ingest, got %d", got)
 	}
 }
+
+func TestCoordinatorAndReaderNodeRolesAndPreferenceRouting(t *testing.T) {
+	ctx := context.Background()
+	s3Srv := s3store.NewMockServer("ak-roles", "sk-roles", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-roles",
+		AccessKey: "ak-roles",
+		SecretKey: "sk-roles",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	specs := []struct {
+		id    string
+		roles []string
+	}{
+		{id: "data-1", roles: []string{sharding.RoleData}},
+		{id: "data-2", roles: []string{sharding.RoleData}},
+		{id: "coord-1", roles: []string{sharding.RoleCoordinator}},
+		{id: "reader-1", roles: []string{sharding.RoleReader}},
+	}
+
+	nodes := make([]*cluster.Node, len(specs))
+	httpSrvs := make([]*httptest.Server, len(specs))
+	peers := make([]sharding.NodeInfo, len(specs))
+
+	for i, sp := range specs {
+		n, err := cluster.NewNode(cluster.NodeConfig{
+			NodeID:            sp.id,
+			Roles:             sp.roles,
+			NVMeDir:           t.TempDir(),
+			NVMeMaxBytes:      32 * 1024 * 1024,
+			FlushInterval:     30 * time.Second,
+			ReplicateInterval: 20 * time.Millisecond,
+			ScrubInterval:     30 * time.Second,
+			S3:                s3Client,
+		})
+		if err != nil {
+			t.Fatalf("new node %s: %v", sp.id, err)
+		}
+		nodes[i] = n
+		httpSrvs[i] = httptest.NewServer(api.NewHandler(n))
+		peers[i] = sharding.NodeInfo{
+			ID:      sp.id,
+			Address: strings.TrimPrefix(httpSrvs[i].URL, "http://"),
+			Roles:   sp.roles,
+		}
+	}
+	defer func() {
+		for i := range nodes {
+			_ = nodes[i].Close()
+			httpSrvs[i].Close()
+		}
+	}()
+
+	for _, n := range nodes {
+		n.UpdatePeers(peers)
+	}
+
+	data1, data2, coord, reader := nodes[0], nodes[1], nodes[2], nodes[3]
+	coordURL := httpSrvs[2].URL
+	readerURL := httpSrvs[3].URL
+
+	// 1. Create index via stateless coordinator node (2 shards, 1 replica -> hosted only on data-1 and data-2).
+	createReq, _ := http.NewRequest(http.MethodPut, coordURL+"/telemetry", strings.NewReader(`{"settings":{"number_of_shards":2,"number_of_replicas":1}}`))
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil || createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create index via coordinator failed: err=%v resp=%v", err, createResp)
+	}
+	_ = createResp.Body.Close()
+
+	// Verify coordinator holds 0 shards, reader holds 2 read-only shards with 0 WAL ops,
+	// and all primaries/replicas belong exclusively to data nodes.
+	if st := coord.Stats(); len(st.Shards) != 0 {
+		t.Fatalf("expected coordinator to own 0 shards, got %+v", st.Shards)
+	}
+	rStats := reader.Stats()
+	if len(rStats.Shards) != 2 {
+		t.Fatalf("expected reader to open 2 read-only S3 shard views, got %+v", rStats.Shards)
+	}
+	for _, sh := range rStats.Shards {
+		if !sh.ReadOnly || sh.IsPrimary || sh.WALLength != 0 {
+			t.Fatalf("expected read-only stateless shard on reader, got %+v", sh)
+		}
+	}
+	if len(data1.Stats().Shards) != 2 || len(data2.Stats().Shards) != 2 {
+		t.Fatalf("expected data-1 and data-2 to hold 2 shards each, got %d and %d",
+			len(data1.Stats().Shards), len(data2.Stats().Shards))
+	}
+
+	// 2. Bulk ingest via coordinator (routes writes to data-1 / data-2 primaries; zero WAL writes on coord/reader).
+	bulkBody := strings.Join([]string{
+		`{"index":{"_id":"t-1"}}`,
+		`{"host":"api-1","region":"us-east","latency_ms":14,"msg":"role routing healthy"}`,
+		`{"index":{"_id":"t-2"}}`,
+		`{"host":"api-2","region":"us-west","latency_ms":95,"msg":"role routing slow"}`,
+		"",
+	}, "\n")
+	bResp, err := http.Post(coordURL+"/telemetry/_bulk", "application/x-ndjson", strings.NewReader(bulkBody))
+	if err != nil || bResp.StatusCode != http.StatusOK {
+		t.Fatalf("bulk via coordinator failed: err=%v resp=%v", err, bResp)
+	}
+	_ = bResp.Body.Close()
+
+	// 3. Before flush: GET /{index}/_doc/{id} on reader must forward to data primary and return NRT doc;
+	// default search on coordinator must find both NRT WAL docs.
+	gResp, err := http.Get(readerURL + "/telemetry/_doc/t-1")
+	if err != nil || gResp.StatusCode != http.StatusOK {
+		t.Fatalf("NRT get via reader failed: err=%v resp=%v", err, gResp)
+	}
+	var gotDoc map[string]any
+	_ = json.NewDecoder(gResp.Body).Decode(&gotDoc)
+	_ = gResp.Body.Close()
+	if gotDoc["found"] != true {
+		t.Fatalf("expected NRT doc found via reader primary forward, got %+v", gotDoc)
+	}
+
+	sResp, err := http.Post(coordURL+"/telemetry/_search", "application/json", strings.NewReader(`{"query":{"match":{"msg":"routing"}}}`))
+	if err != nil {
+		t.Fatalf("NRT search via coordinator: %v", err)
+	}
+	var nrtOut map[string]any
+	_ = json.NewDecoder(sResp.Body).Decode(&nrtOut)
+	_ = sResp.Body.Close()
+	if int(nrtOut["hits"].(map[string]any)["total"].(map[string]any)["value"].(float64)) != 2 {
+		t.Fatalf("expected 2 NRT hits via coordinator, got %+v", nrtOut)
+	}
+
+	// 4. Flush segments from data nodes to S3 via coordinator, then query with ?preference=reader
+	// and verify the stateless reader hydrates from S3 into its own NVMe cache.
+	fResp, err := http.Post(coordURL+"/telemetry/_refresh?flush=true", "application/json", nil)
+	if err != nil || fResp.StatusCode != http.StatusOK {
+		t.Fatalf("flush via coordinator failed: err=%v resp=%v", err, fResp)
+	}
+	_ = fResp.Body.Close()
+
+	if reader.NVMeCache().Stats().Entries != 0 {
+		t.Fatalf("expected reader NVMe cache empty before reader-routed search, got %+v", reader.NVMeCache().Stats())
+	}
+
+	rSearchResp, err := http.Post(coordURL+"/telemetry/_search?preference=reader", "application/json", strings.NewReader(`{"query":{"match":{"msg":"routing"}}}`))
+	if err != nil || rSearchResp.StatusCode != http.StatusOK {
+		t.Fatalf("preference=reader search failed: err=%v resp=%v", err, rSearchResp)
+	}
+	var readerOut map[string]any
+	_ = json.NewDecoder(rSearchResp.Body).Decode(&readerOut)
+	_ = rSearchResp.Body.Close()
+	if int(readerOut["hits"].(map[string]any)["total"].(map[string]any)["value"].(float64)) != 2 {
+		t.Fatalf("expected 2 hits via preference=reader, got %+v", readerOut)
+	}
+	if reader.NVMeCache().Stats().Entries == 0 {
+		t.Fatalf("expected preference=reader search to route to reader and populate reader NVMe cache")
+	}
+
+	// Verify reader also honors X-Cinder-Preference header + direct SearchWithPreference.
+	prefRes, err := coord.SearchWithPreference(ctx, []string{"telemetry"}, query.SearchRequest{
+		Query: map[string]any{"term": map[string]any{"host": "api-1"}},
+	}, cluster.RetrievalDropIn, true)
+	if err != nil {
+		t.Fatalf("SearchWithPreference(preferReader=true): %v", err)
+	}
+	if prefRes["hits"].(map[string]any)["total"].(map[string]any)["value"].(int) != 1 {
+		t.Fatalf("expected 1 hit for host=api-1 via reader preference, got %+v", prefRes)
+	}
+}

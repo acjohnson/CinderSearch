@@ -43,6 +43,7 @@ type ShardManifest struct {
 // an in-memory NRT segment, an NVMe LRU read cache, and S3 immutable segments.
 type Shard struct {
 	mu        sync.RWMutex
+	flushMu   sync.Mutex
 	indexName string
 	shardID   int
 	isPrimary bool
@@ -125,11 +126,12 @@ func OpenShard(
 // IndexLocal computes CRC32C on the fly, writes to the NVMe WAL for sub-ms durability,
 // and updates the NRT memtable for immediate availability.
 func (s *Shard) IndexLocal(docID string, rawJSON []byte) (wal.Record, error) {
+	s.mu.Lock()
 	rec, err := s.wal.Append(wal.OpIndex, s.indexName, docID, rawJSON)
 	if err != nil {
+		s.mu.Unlock()
 		return wal.Record{}, err
 	}
-	s.mu.Lock()
 	s.memDocs[docID] = rec
 	s.memDirty = true
 	s.mu.Unlock()
@@ -139,11 +141,12 @@ func (s *Shard) IndexLocal(docID string, rawJSON []byte) (wal.Record, error) {
 
 // DeleteLocal appends a delete tombstone into the NVMe WAL.
 func (s *Shard) DeleteLocal(docID string) (wal.Record, error) {
+	s.mu.Lock()
 	rec, err := s.wal.Append(wal.OpDelete, s.indexName, docID, nil)
 	if err != nil {
+		s.mu.Unlock()
 		return wal.Record{}, err
 	}
-	s.mu.Lock()
 	s.memDocs[docID] = rec
 	s.memDirty = true
 	s.mu.Unlock()
@@ -233,17 +236,22 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 		return nil, fmt.Errorf("s3 client not configured")
 	}
 
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	s.mu.Lock()
 	if len(s.memDocs) == 0 {
 		s.mu.Unlock()
 		return nil, nil
 	}
 	inputs := make([]segment.InputDoc, 0, len(s.memDocs))
+	flushedSeqs := make(map[string]uint64, len(s.memDocs))
 	var maxSeq uint64
-	for _, rec := range s.memDocs {
+	for docID, rec := range s.memDocs {
 		if rec.Seq > maxSeq {
 			maxSeq = rec.Seq
 		}
+		flushedSeqs[docID] = rec.Seq
 		inputs = append(inputs, segment.InputDoc{
 			DocID:   rec.DocID,
 			Seq:     rec.Seq,
@@ -252,8 +260,8 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 			CRC32C:  checksum.Sum32C(rec.Payload),
 		})
 	}
-	s.segCounter++
-	segID := fmt.Sprintf("seg-%06d", s.segCounter)
+	nextCounter := s.segCounter + 1
+	segID := fmt.Sprintf("seg-%06d", nextCounter)
 	idxKey := fmt.Sprintf("%s/shard-%d/%s.idx", s.indexName, s.shardID, segID)
 	docsKey := fmt.Sprintf("%s/shard-%d/%s.docs", s.indexName, s.shardID, segID)
 	s.mu.Unlock()
@@ -291,12 +299,21 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	}
 
 	s.mu.Lock()
+	s.segCounter = nextCounter
 	s.segments = append(s.segments, ref)
-	s.flushedSeq = maxSeq
 	for docID, rec := range s.memDocs {
-		if rec.Seq <= maxSeq {
+		if fSeq, ok := flushedSeqs[docID]; ok && rec.Seq <= fSeq {
 			delete(s.memDocs, docID)
 		}
+	}
+	compactSeq := maxSeq
+	for _, rec := range s.memDocs {
+		if rec.Seq > 0 && rec.Seq-1 < compactSeq {
+			compactSeq = rec.Seq - 1
+		}
+	}
+	if compactSeq > s.flushedSeq {
+		s.flushedSeq = compactSeq
 	}
 	s.memDirty = len(s.memDocs) > 0
 	if s.memDirty {
@@ -319,8 +336,10 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	if _, err := s.s3.PutObject(ctx, manifestKey(s.indexName, s.shardID), manBytes); err != nil {
 		return nil, err
 	}
-	if err := s.wal.CompactUpTo(maxSeq); err != nil {
-		return nil, err
+	if compactSeq > 0 {
+		if err := s.wal.CompactUpTo(compactSeq); err != nil {
+			return nil, err
+		}
 	}
 	return &ref, nil
 }

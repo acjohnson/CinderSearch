@@ -262,14 +262,22 @@ func TestESDocCRUDUpdateBulkAndCrossNodeCRC(t *testing.T) {
 		t.Fatalf("expected bulk update field priority=high, got %+v", afterBulkUpd["_source"])
 	}
 
-	// 5. Explicit DELETE /{index}/_doc/{id}
+	// 5. Explicit DELETE /{index}/_doc/{id} on auto-created index (with 1 async replica);
+	// verify replica node converges to 404 after async WAL replication delivers the tombstone.
 	code, delDoc := doJSONReq(t, http.MethodDelete, srvs[1].URL+"/metrics/_doc/m-1", "", nil)
 	if code != http.StatusOK || delDoc["result"] != "deleted" {
 		t.Fatalf("delete doc failed: code=%d body=%+v", code, delDoc)
 	}
-	code, _ = doJSONReq(t, http.MethodGet, srvs[0].URL+"/metrics/_doc/m-1", "", nil)
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		code, _ = doJSONReq(t, http.MethodGet, srvs[0].URL+"/metrics/_doc/m-1", "", nil)
+		if code == http.StatusNotFound {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
 	if code != http.StatusNotFound {
-		t.Fatalf("expected 404 after delete doc, got %d", code)
+		t.Fatalf("expected 404 after delete doc propagated to replica, got %d", code)
 	}
 }
 

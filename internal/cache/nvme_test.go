@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"sync/atomic"
 	"testing"
@@ -97,4 +98,52 @@ func TestNVMeScrubAndOverwriteAccounting(t *testing.T) {
 	if _, hit, _ := c.Get("k2"); hit {
 		t.Fatalf("expected k2 purged after scrub")
 	}
+}
+
+func BenchmarkNVMeCachePut4KB(b *testing.B) {
+	c, err := NewNVMeCache(b.TempDir(), 64*1024*1024)
+	if err != nil {
+		b.Fatalf("new nvme cache: %v", err)
+	}
+	val := bytes.Repeat([]byte("c"), 4096)
+	crc := checksum.Sum32C(val)
+	keys := []string{
+		"seg/00.idx", "seg/01.idx", "seg/02.idx", "seg/03.idx",
+		"seg/04.idx", "seg/05.idx", "seg/06.idx", "seg/07.idx",
+		"seg/08.idx", "seg/09.idx", "seg/10.idx", "seg/11.idx",
+		"seg/12.idx", "seg/13.idx", "seg/14.idx", "seg/15.idx",
+	}
+
+	b.SetBytes(int64(len(val)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := c.Put(keys[i&15], val, crc); err != nil {
+			b.Fatalf("nvme put: %v", err)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkNVMeCacheGetHit4KB(b *testing.B) {
+	c, err := NewNVMeCache(b.TempDir(), 64*1024*1024)
+	if err != nil {
+		b.Fatalf("new nvme cache: %v", err)
+	}
+	val := bytes.Repeat([]byte("c"), 4096)
+	crc := checksum.Sum32C(val)
+	if err := c.Put("seg/hit.idx", val, crc); err != nil {
+		b.Fatalf("seed nvme cache: %v", err)
+	}
+
+	b.SetBytes(int64(len(val)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got, hit, err := c.Get("seg/hit.idx")
+		if err != nil || !hit || len(got) != len(val) {
+			b.Fatalf("unexpected nvme get: hit=%v err=%v len=%d", hit, err, len(got))
+		}
+	}
+	b.StopTimer()
 }

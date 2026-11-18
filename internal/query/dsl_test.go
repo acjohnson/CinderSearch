@@ -2,6 +2,7 @@ package query
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"testing"
 
@@ -282,5 +283,85 @@ func TestDSLSortSourceFilterPaginationAndAllMetricAggs(t *testing.T) {
 	})
 	if err != nil || emptyAggs["s"].(map[string]any)["count"].(int) != 0 {
 		t.Fatalf("unexpected empty stats agg: %+v err=%v", emptyAggs, err)
+	}
+}
+
+func buildBenchQuerySegment(b *testing.B, n int) *segment.Segment {
+	b.Helper()
+	services := []string{"checkout", "search", "payments", "inventory", "auth"}
+	docs := make([]segment.InputDoc, n)
+	for i := 0; i < n; i++ {
+		raw := []byte(fmt.Sprintf(
+			`{"service":%q,"level":"info","latency_ms":%d,"message":"s3 range nvme segment lookup worker %d","created_at":"2026-11-17T10:15:00Z"}`,
+			services[i%len(services)], (i%500)+1, i%16,
+		))
+		docs[i] = segment.InputDoc{
+			DocID:   fmt.Sprintf("doc-%d", i),
+			Seq:     uint64(i + 1),
+			RawJSON: raw,
+		}
+	}
+	seg, _, _, err := segment.Build("seg-qbench", "logs", 0, docs, "logs/shard-0/seg-qbench.idx", "logs/shard-0/seg-qbench.docs")
+	if err != nil {
+		b.Fatalf("build query bench segment: %v", err)
+	}
+	return seg
+}
+
+func BenchmarkQueryMatchPhraseAndRange1000Docs(b *testing.B) {
+	seg := buildBenchQuerySegment(b, 1000)
+	q := map[string]any{
+		"bool": map[string]any{
+			"must": []any{
+				map[string]any{"match_phrase": map[string]any{"message": "nvme segment"}},
+			},
+			"filter": []any{
+				map[string]any{"range": map[string]any{"latency_ms": map[string]any{"gte": float64(100)}}},
+			},
+		},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hits, err := EvaluateSegment(seg, q)
+		if err != nil || len(hits) == 0 {
+			b.Fatalf("evaluate segment: err=%v hits=%d", err, len(hits))
+		}
+	}
+}
+
+func BenchmarkQueryTermsAndStatsAggs1000Docs(b *testing.B) {
+	seg := buildBenchQuerySegment(b, 1000)
+	hits, err := EvaluateSegment(seg, map[string]any{"match_all": map[string]any{}})
+	if err != nil {
+		b.Fatalf("evaluate match_all: %v", err)
+	}
+	refs := make([]DocRef, len(hits))
+	for i, h := range hits {
+		refs[i] = DocRef{Seg: seg, DocIdx: h.DocIdx, Score: h.Score}
+	}
+	aggsSpec := map[string]any{
+		"by_service": map[string]any{
+			"terms": map[string]any{"field": "service"},
+			"aggs": map[string]any{
+				"avg_latency": map[string]any{"avg": map[string]any{"field": "latency_ms"}},
+			},
+		},
+		"latency_stats": map[string]any{
+			"stats": map[string]any{"field": "latency_ms"},
+		},
+		"hourly": map[string]any{
+			"date_histogram": map[string]any{"field": "created_at", "fixed_interval": "1h"},
+		},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := ComputeAggregations(refs, aggsSpec)
+		if err != nil || len(out) == 0 {
+			b.Fatalf("compute aggregations: err=%v len=%d", err, len(out))
+		}
 	}
 }

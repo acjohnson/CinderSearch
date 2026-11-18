@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +18,7 @@ import (
 	"github.com/cindersearch/cindersearch/internal/sharding"
 )
 
-func newTestCluster(t *testing.T, nodeCount int, nvmeMaxBytes int64) ([]*cluster.Node, []*httptest.Server, *s3store.MockServer, *s3store.Client) {
+func newTestCluster(t testing.TB, nodeCount int, nvmeMaxBytes int64) ([]*cluster.Node, []*httptest.Server, *s3store.MockServer, *s3store.Client) {
 	t.Helper()
 
 	s3Srv := s3store.NewMockServer("ak-api", "sk-api", "us-east-1")
@@ -74,7 +75,7 @@ func newTestCluster(t *testing.T, nodeCount int, nvmeMaxBytes int64) ([]*cluster
 	return nodes, httpSrvs, s3Srv, s3Client
 }
 
-func doJSONReq(t *testing.T, method, url, body string, headers map[string]string) (int, map[string]any) {
+func doJSONReq(t testing.TB, method, url, body string, headers map[string]string) (int, map[string]any) {
 	t.Helper()
 	var r io.Reader
 	if body != "" {
@@ -399,4 +400,113 @@ func TestESSearchEndpointsAndRetrievalModes(t *testing.T) {
 	if code != http.StatusBadRequest || badDSL["error"] == nil {
 		t.Fatalf("expected 400 ES error for unsupported query clause, got %d body=%+v", code, badDSL)
 	}
+}
+
+func makeBulkBenchPayload(n int) []byte {
+	services := []string{"checkout", "search", "payments", "inventory", "auth"}
+	var buf bytes.Buffer
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&buf, "{\"index\":{\"_id\":\"doc-%d\"}}\n", i)
+		fmt.Fprintf(&buf, "{\"service\":%q,\"level\":\"info\",\"latency_ms\":%d,\"message\":\"s3 range nvme segment lookup worker %d\"}\n",
+			services[i%len(services)], (i%500)+1, i%16)
+	}
+	return buf.Bytes()
+}
+
+func seedBenchSearchCluster(b *testing.B, docs int) (*httptest.Server, *http.Client) {
+	b.Helper()
+	_, srvs, _, _ := newTestCluster(b, 1, 128*1024*1024)
+	code, _ := doJSONReq(b, http.MethodPut, srvs[0].URL+"/bench?pretty=false", `{"settings":{"number_of_shards":3,"number_of_replicas":0}}`, nil)
+	if code != http.StatusOK {
+		b.Fatalf("create bench index: %d", code)
+	}
+
+	client := srvs[0].Client()
+	payload := makeBulkBenchPayload(docs)
+	resp, err := client.Post(srvs[0].URL+"/bench/_bulk?pretty=false", "application/x-ndjson", bytes.NewReader(payload))
+	if err != nil {
+		b.Fatalf("seed bulk: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b.Fatalf("seed bulk status %d", resp.StatusCode)
+	}
+
+	fResp, err := client.Post(srvs[0].URL+"/bench/_refresh?flush=true&pretty=false", "application/json", nil)
+	if err != nil {
+		b.Fatalf("seed flush: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, fResp.Body)
+	_ = fResp.Body.Close()
+	if fResp.StatusCode >= 300 {
+		b.Fatalf("seed flush status %d", fResp.StatusCode)
+	}
+	return srvs[0], client
+}
+
+func BenchmarkESBulkIngestHTTP(b *testing.B) {
+	_, srvs, _, _ := newTestCluster(b, 1, 128*1024*1024)
+	code, _ := doJSONReq(b, http.MethodPut, srvs[0].URL+"/bench?pretty=false", `{"settings":{"number_of_shards":3,"number_of_replicas":0}}`, nil)
+	if code != http.StatusOK {
+		b.Fatalf("create bench index: %d", code)
+	}
+
+	client := srvs[0].Client()
+	payload := makeBulkBenchPayload(100)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Post(srvs[0].URL+"/bench/_bulk?pretty=false", "application/x-ndjson", bytes.NewReader(payload))
+		if err != nil {
+			b.Fatalf("post _bulk: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			b.Fatalf("_bulk status %d", resp.StatusCode)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkESSearchDropInHTTP(b *testing.B) {
+	srv, client := seedBenchSearchCluster(b, 500)
+	queryBody := []byte(`{"query":{"bool":{"must":[{"match_phrase":{"message":"nvme segment"}}],"filter":[{"range":{"latency_ms":{"gte":100}}}]}},"size":10,"aggs":{"by_service":{"terms":{"field":"service"}},"stats":{"stats":{"field":"latency_ms"}}}}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Post(srv.URL+"/bench/_search?pretty=false", "application/json", bytes.NewReader(queryBody))
+		if err != nil {
+			b.Fatalf("post _search: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			b.Fatalf("_search status %d", resp.StatusCode)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkESSearchPresignedZeroHopHTTP(b *testing.B) {
+	srv, client := seedBenchSearchCluster(b, 500)
+	queryBody := []byte(`{"query":{"term":{"_id":"doc-42"}},"size":1}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Post(srv.URL+"/bench/_search?retrieval=presigned&pretty=false", "application/json", bytes.NewReader(queryBody))
+		if err != nil {
+			b.Fatalf("post presigned _search: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			b.Fatalf("presigned _search status %d", resp.StatusCode)
+		}
+	}
+	b.StopTimer()
 }

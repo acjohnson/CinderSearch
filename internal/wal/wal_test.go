@@ -130,3 +130,31 @@ func TestWALPartialCompactionFsyncAndReplicaReplay(t *testing.T) {
 		t.Fatalf("unexpected replica WAL state: %+v", repWAL.Since(0))
 	}
 }
+
+func benchmarkWALAppend(b *testing.B, fsyncOnWrite bool) {
+	path := filepath.Join(b.TempDir(), "bench.wal")
+	w, err := Open(path, fsyncOnWrite)
+	if err != nil {
+		b.Fatalf("open wal: %v", err)
+	}
+	defer w.Close()
+
+	payload := []byte(`{"service":"checkout","level":"info","latency_ms":42,"message":"s3 range nvme wal benchmark payload"}`)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := w.Append(OpIndex, "logs", "doc-1", payload); err != nil {
+			b.Fatalf("wal append: %v", err)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkWALAppendBuffered(b *testing.B) {
+	benchmarkWALAppend(b, false)
+}
+
+func BenchmarkWALAppendFsync(b *testing.B) {
+	benchmarkWALAppend(b, true)
+}

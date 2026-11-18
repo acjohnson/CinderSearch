@@ -8,7 +8,7 @@ GO          ?= go
 GOFLAGS     ?=
 RACE_FLAG   := -race
 
-.PHONY: all build test test-v race bench demo run fmt fmt-check vet lint tidy clean help
+.PHONY: all build test test-v race bench bench-live profile-cpu profile-mem demo run fmt fmt-check vet lint tidy clean help
 
 all: vet test build
 
@@ -29,9 +29,23 @@ test-v:
 ## race: Alias for race-enabled test suite
 race: test
 
-## bench: Run Go microbenchmarks for CRC32C, indexing, and search
+## bench: Run Go microbenchmarks for CRC32C, WAL, NVMe, segment, query, and HTTP
 bench:
 	$(GO) test -run=^$$ -bench=. -benchmem ./...
+
+## bench-live: Build binary and run end-to-end throughput/latency benchmark
+bench-live: build
+	./$(BINARY) bench --docs=5000 --batch-size=250 --concurrency=8 --queries=1000
+
+## profile-cpu: Run load benchmark with CPU pprof output and top hotspots summary
+profile-cpu: build
+	./$(BINARY) bench --docs=10000 --batch-size=250 --concurrency=8 --queries=2000 --cpuprofile=/tmp/cindersearch-cpu.pprof
+	$(GO) tool pprof -top -cum /tmp/cindersearch-cpu.pprof | head -n 30
+
+## profile-mem: Run load benchmark with Heap pprof output and top allocs summary
+profile-mem: build
+	./$(BINARY) bench --docs=10000 --batch-size=250 --concurrency=8 --queries=2000 --memprofile=/tmp/cindersearch-mem.pprof
+	$(GO) tool pprof -top -alloc_space /tmp/cindersearch-mem.pprof | head -n 30
 
 ## demo: Build and run the end-to-end 3-node S3 + NVMe + Bit-Rot self-healing demo
 demo: build

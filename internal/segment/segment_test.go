@@ -2,6 +2,7 @@ package segment
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/cindersearch/cindersearch/internal/checksum"
@@ -92,5 +93,52 @@ func TestSegmentTombstonesDedupAndFlattening(t *testing.T) {
 	}
 	if _, _, _, err := Build("bad", "orders", 0, []InputDoc{{DocID: "x", Seq: 1, RawJSON: []byte(`{bad json`)}}, "", ""); err == nil {
 		t.Fatalf("expected error on invalid JSON document")
+	}
+}
+
+func makeBenchInputDocs(n int) ([]InputDoc, int64) {
+	services := []string{"checkout", "search", "payments", "inventory", "auth"}
+	docs := make([]InputDoc, n)
+	var totalBytes int64
+	for i := 0; i < n; i++ {
+		raw := []byte(fmt.Sprintf(
+			`{"service":%q,"level":"info","latency_ms":%d,"message":"s3 range nvme segment lookup worker %d","created_at":"2026-11-17T10:15:00Z"}`,
+			services[i%len(services)], (i%500)+1, i%16,
+		))
+		totalBytes += int64(len(raw))
+		docs[i] = InputDoc{
+			DocID:   fmt.Sprintf("doc-%d", i),
+			Seq:     uint64(i + 1),
+			RawJSON: raw,
+		}
+	}
+	return docs, totalBytes
+}
+
+func BenchmarkSegmentBuild100Docs(b *testing.B) {
+	docs, totalBytes := makeBenchInputDocs(100)
+	b.SetBytes(totalBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, _, err := Build("seg-bench", "logs", 0, docs, "logs/shard-0/seg-bench.idx", "logs/shard-0/seg-bench.docs"); err != nil {
+			b.Fatalf("build segment: %v", err)
+		}
+	}
+}
+
+func BenchmarkSegmentUnmarshalIndex(b *testing.B) {
+	docs, _ := makeBenchInputDocs(100)
+	_, idxBytes, _, err := Build("seg-bench", "logs", 0, docs, "logs/shard-0/seg-bench.idx", "logs/shard-0/seg-bench.docs")
+	if err != nil {
+		b.Fatalf("seed segment: %v", err)
+	}
+	b.SetBytes(int64(len(idxBytes)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := UnmarshalIndex(idxBytes); err != nil {
+			b.Fatalf("unmarshal segment index: %v", err)
+		}
 	}
 }

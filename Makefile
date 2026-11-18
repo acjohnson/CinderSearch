@@ -8,9 +8,9 @@ GO          ?= go
 GOFLAGS     ?=
 RACE_FLAG   := -race
 
-.PHONY: all build test test-v race bench demo run fmt vet lint tidy clean help
+.PHONY: all build test test-v race bench demo run fmt fmt-check vet lint tidy clean help
 
-all: fmt vet test build
+all: vet test build
 
 ## build: Compile the CinderSearch binary to bin/cindersearch
 build:
@@ -41,9 +41,13 @@ demo: build
 run: build
 	./$(BINARY) serve --node-id node-1 --listen :9200 --embedded-s3 --nvme-dir /tmp/cindersearch-nvme
 
-## fmt: Format all Go source files
+## fmt: Format all Go source files in-place (opt-in)
 fmt:
 	gofmt -s -w cmd internal
+
+## fmt-check: Check Go formatting without modifying files
+fmt-check:
+	@test -z "$$(gofmt -l cmd internal)" || (echo "Unformatted files:"; gofmt -l cmd internal; exit 1)
 
 ## vet: Run go vet static analysis
 vet:

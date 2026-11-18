@@ -3,6 +3,7 @@ package s3store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -48,7 +49,7 @@ func TestS3PutRangeAndZeroHopPresignedFetch(t *testing.T) {
 	}
 	start := len(doc1)
 	end := len(doc1) + len(doc2) - 1
-	req.Header.Set("Range", "bytes=29-62")
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

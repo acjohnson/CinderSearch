@@ -680,14 +680,21 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 	totalShards := len(targetShards)
 	successfulShards := 0
 	failedShards := 0
+	var firstErr error
 	var allHits []ShardSearchHit
 	for r := range resCh {
 		if r.err != nil {
 			failedShards++
+			if firstErr == nil {
+				firstErr = r.err
+			}
 			continue
 		}
 		successfulShards++
 		allHits = append(allHits, r.hits...)
+	}
+	if successfulShards == 0 && failedShards > 0 && firstErr != nil {
+		return nil, firstErr
 	}
 
 	// Build temporary DocRefs so query.CompareDocRefs & query.ComputeAggregations work uniformly across shards.

@@ -26,15 +26,22 @@ const MAKE_TARGETS = [
   { target: 'make test', desc: 'Run unit & 3-node integration tests with -race enabled' },
   { target: 'make demo', desc: 'Boot embedded S3 + 3-node cluster, test zero-hop Range & bit-rot heal' },
   { target: 'make run', desc: 'Start single-node Elasticsearch-compatible server on :9200' },
-  { target: 'make bench', desc: 'Run Go microbenchmarks for CRC32C and query throughput' },
+  { target: 'make bench', desc: 'Run Go microbenchmarks for CRC32C, NVMe, segment, and query HTTP' },
+  { target: 'make bench-live', desc: 'Run end-to-end ingest, flush, drop-in & presigned search benchmark' },
+  { target: 'make profile-cpu', desc: 'Capture CPU pprof profile & print top cumulative hotspots' },
   { target: 'make vet', desc: 'Run static analysis across all Go packages' },
 ];
 
 const ES_COMPAT_MATRIX = [
   {
     surface: 'Index & Cluster REST',
-    endpoints: 'GET /, GET /_cluster/health, GET /_cat/indices, GET /_cat/shards, PUT/GET/DELETE /{index}, POST /{index}/_refresh',
-    notes: 'Supports settings.number_of_shards, settings.number_of_replicas, and ?flush=true for S3 commit',
+    endpoints: 'GET /, GET /_cluster/health, GET /_nodes, GET /_cat/nodes, GET /_cat/indices, GET /_cat/shards, PUT/GET/DELETE /{index}, POST /{index}/_refresh',
+    notes: 'Pretty JSON by default (?pretty=false for compact), number_of_shards/replicas, and ?flush=true for S3 commit',
+  },
+  {
+    surface: 'Node Roles & Routing',
+    endpoints: '--roles=data|coordinator|reader, --peers=id=host:port[@role1+role2], ?preference=reader (X-Cinder-Preference)',
+    notes: 'Only data nodes own shard WALs; coordinators are stateless routers; readers serve flushed S3+NVMe queries',
   },
   {
     surface: 'Document CRUD & Bulk',
@@ -59,7 +66,7 @@ const ES_COMPAT_MATRIX = [
   {
     surface: 'Zero-Hop S3 Retrieval',
     endpoints: '?retrieval=dropin | presigned | hybrid (or X-Cinder-Retrieval header)',
-    notes: 'Returns AWS SigV4 Presigned URL + exact Range: bytes=start-end + CRC32C digest',
+    notes: 'Drop-in _source by default; opt-in SigV4 Presigned URL + Range: bytes=start-end + CRC32C digest',
   },
 ];
 

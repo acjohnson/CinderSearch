@@ -8,9 +8,15 @@
 - **S3-First Authoritative Storage + NVMe Tiered Cache**:
   - **Write Path**: Incoming documents are `CRC32C`-checksummed on the fly, appended to a local NVMe Write-Ahead Log (WAL) for sub-millisecond acknowledgment, asynchronously shipped in batches to replica shards, and flushed in the background into immutable S3 segments.
   - **Read Path**: Inverted index terms, positional postings, and columnar DocValues are hydrated via HTTP `Range` requests from S3 and cached on local NVMe SSD (`LRU` eviction + background `CRC32C` bit-rot scrubber).
-- **Zero-Hop Direct S3 Retrieval**:
-  - Default mode returns standard Elasticsearch `_source` JSON for drop-in client compatibility.
-  - Passing `?retrieval=presigned` (or `X-Cinder-Retrieval: presigned`) returns `_s3_pointer: {url, range, crc32c}` pointing straight at the document's exact byte slice inside the S3 segment object—eliminating DB proxy hops on document fetches.
+- **Zero-Hop Direct S3 Retrieval (Opt-In for ES Client Compatibility)**:
+  - `retrieval=dropin` *(default)* returns standard Elasticsearch `_source` JSON for full compatibility with official Elasticsearch/OpenSearch clients.
+  - Passing `?retrieval=presigned` (or `X-Cinder-Retrieval: presigned`) omits `_source` on S3-committed documents and returns `_s3_pointer: {url, range, crc32c}` pointing straight at the document's exact byte slice inside the S3 segment object—eliminating DB proxy hops on document fetches.
+  - Passing `?retrieval=hybrid` returns `_s3_pointer` and also inlines `_source` only when hot in local NVMe cache.
+- **Role-Based Cluster Topology (`data`, `coordinator`, `reader`)**:
+  - `data` *(default)*: Owns shard primaries/replicas in the consistent hash ring, accepts NVMe WAL writes, replicates asynchronously, and flushes immutable segments to S3.
+  - `coordinator`: Stateless HTTP router, Query DSL scatter-gather coordinator, and cross-shard aggregation/sort merger with zero local shards or WALs.
+  - `reader`: Stateless S3 + NVMe read-cache search node (no WALs, no shard ownership) for horizontally scaling search QPS; supports `?preference=reader` / `X-Cinder-Preference: reader` routing while still forwarding `_doc` reads to `data` primaries for NRT consistency.
+  - Unsupported legacy ES roles (`master`, `ml`, `ingest`, `data_hot`/`warm`/`cold`/`frozen`, `transform`, `remote_cluster_client`) are explicitly rejected—leaderless ring metadata + S3 tiering replace master-only and hot/warm/cold splits.
 - **Bit-Rot Protection**: Every WAL frame, replica stream, NVMe cache entry, S3 segment footer, and `_s3_pointer` carries a Castagnoli `CRC32C` digest. Corrupted NVMe cache entries are quarantined and automatically healed from S3.
 
 ## Quickstart
@@ -27,11 +33,43 @@ make demo
 
 # Start a single-node Elasticsearch-compatible server on :9200 with embedded S3
 make run
+
+# Profiling & Benchmarks (see BENCHMARKS.md for baselines)
+make bench        # Go package microbenchmarks
+make bench-live   # End-to-end _bulk, S3 flush, drop-in & presigned search benchmark
+make profile-cpu  # Generate & inspect CPU pprof hotspots
+make profile-mem  # Generate & inspect Heap alloc_space pprof hotspots
 ```
+
+## Multi-Node Roles Topology
+
+```bash
+# Start a data node owning shards on :9201
+./bin/cindersearch serve --node-id=data-1 --roles=data --listen=127.0.0.1:9201 \
+  --peers=data-2=127.0.0.1:9202@data,coord-1=127.0.0.1:9200@coordinator,reader-1=127.0.0.1:9203@reader
+
+# Start a stateless coordinator gateway on :9200 (0 shards, no WAL)
+./bin/cindersearch serve --node-id=coord-1 --roles=coordinator --listen=127.0.0.1:9200 \
+  --peers=data-1=127.0.0.1:9201@data,data-2=127.0.0.1:9202@data,reader-1=127.0.0.1:9203@reader
+
+# Start a stateless S3+NVMe search reader on :9203 (0 WALs)
+./bin/cindersearch serve --node-id=reader-1 --roles=reader --listen=127.0.0.1:9203 \
+  --peers=data-1=127.0.0.1:9201@data,data-2=127.0.0.1:9202@data,coord-1=127.0.0.1:9200@coordinator
+```
+
+Nodes can hold multiple comma-separated roles (e.g., `--roles=data,reader` or `@data+reader` in `--peers`).
 
 ## Drop-In Elasticsearch Usage
 
+Responses are pretty-printed JSON by default (matching Elasticsearch/OpenSearch); append `?pretty=false` for compact single-line JSON on high-throughput clients.
+
 ```bash
+# Inspect cluster health, node roles, and _cat views
+curl http://localhost:9200/
+curl http://localhost:9200/_cluster/health
+curl http://localhost:9200/_nodes
+curl http://localhost:9200/_cat/nodes
+
 # Create an index with 3 shards and 1 replica
 curl -X PUT http://localhost:9200/logs -H 'Content-Type: application/json' -d '{
   "settings": { "number_of_shards": 3, "number_of_replicas": 1 }
@@ -57,6 +95,11 @@ curl -X POST http://localhost:9200/logs/_search -H 'Content-Type: application/js
     "by_service": { "terms": { "field": "service" } },
     "latency_stats": { "stats": { "field": "latency_ms" } }
   }
+}'
+
+# Route flushed search reads to stateless S3+NVMe reader nodes
+curl -X POST 'http://localhost:9200/logs/_search?preference=reader' -H 'Content-Type: application/json' -d '{
+  "query": { "match_all": {} }
 }'
 
 # Zero-Hop Direct S3 Retrieval (returns presigned Range URLs + CRC32C)

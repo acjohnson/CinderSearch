@@ -1,5 +1,5 @@
 {
-  "name": "StrataDB",
+  "name": "CinderSearch",
   "description": "S3-first, NVMe-cached distributed search engine in Go with drop-in Elasticsearch compatibility, CRC32C bit-rot protection, and zero-hop presigned S3 document retrieval.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

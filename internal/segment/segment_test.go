@@ -90,7 +90,7 @@ func TestSegmentTombstonesDedupAndFlattening(t *testing.T) {
 	if len(dv.Keywords["tags"]) != 2 || dv.Keywords["nested.region"][0] != "eu-west" {
 		t.Fatalf("unexpected array/nested keyword DocValues: %+v", dv.Keywords)
 	}
-	if _, err := Build("bad", "orders", 0, []InputDoc{{DocID: "x", Seq: 1, RawJSON: []byte(`{bad json`)}}, "", ""); err == nil {
+	if _, _, _, err := Build("bad", "orders", 0, []InputDoc{{DocID: "x", Seq: 1, RawJSON: []byte(`{bad json`)}}, "", ""); err == nil {
 		t.Fatalf("expected error on invalid JSON document")
 	}
 }

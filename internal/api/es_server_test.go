@@ -274,8 +274,8 @@ func TestESDocCRUDUpdateBulkAndCrossNodeCRC(t *testing.T) {
 }
 
 func TestESSearchEndpointsAndRetrievalModes(t *testing.T) {
-	// Tight NVMe cache budget (512 bytes) to verify hybrid mode behavior when cached vs evicted.
-	nodes, srvs, _, _ := newTestCluster(t, 1, 512)
+	// Bounded 32KB NVMe cache budget to verify hybrid mode behavior when hot vs evicted.
+	nodes, srvs, _, _ := newTestCluster(t, 1, 32*1024)
 
 	code, _ := doJSONReq(t, http.MethodPut, srvs[0].URL+"/idx_a", `{"settings":{"number_of_shards":1,"number_of_replicas":0}}`, nil)
 	if code != http.StatusOK {
@@ -341,11 +341,13 @@ func TestESSearchEndpointsAndRetrievalModes(t *testing.T) {
 		t.Fatalf("expected nvme_cached=true on hot hybrid hit: %+v", hotHit["_s3_pointer"])
 	}
 
-	// 4. Evict idx_a .docs from NVMe cache by putting > 512 bytes of unrelated data,
+	// 4. Evict idx_a .docs from the 32KB NVMe cache by writing 4x10KB entries,
 	// then verify hybrid mode returns nvme_cached=false and omits _source!
-	bigBlob := bytes.Repeat([]byte("z"), 480)
+	bigBlob := bytes.Repeat([]byte("z"), 10*1024)
 	_ = nodes[0].NVMeCache().Put("evict-1", bigBlob, 0)
 	_ = nodes[0].NVMeCache().Put("evict-2", bigBlob, 0)
+	_ = nodes[0].NVMeCache().Put("evict-3", bigBlob, 0)
+	_ = nodes[0].NVMeCache().Put("evict-4", bigBlob, 0)
 
 	code, coldHybrid := doJSONReq(t, http.MethodPost, srvs[0].URL+"/idx_a/_search?retrieval=hybrid", `{"query":{"term":{"_id":"a1"}}}`, nil)
 	if code != http.StatusOK {

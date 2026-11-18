@@ -62,3 +62,39 @@ func TestNVMeCacheHitLRUEvictionAndBitRotHealing(t *testing.T) {
 		t.Fatalf("expected LRU eviction, got stats %+v", st)
 	}
 }
+
+func TestNVMeScrubAndOverwriteAccounting(t *testing.T) {
+	c, err := NewNVMeCache(t.TempDir(), 256)
+	if err != nil {
+		t.Fatalf("new nvme cache: %v", err)
+	}
+
+	if err := c.Put("k1", []byte("1234567890"), 0); err != nil {
+		t.Fatalf("put k1: %v", err)
+	}
+	if err := c.Put("k2", []byte("abcdefghij"), 0); err != nil {
+		t.Fatalf("put k2: %v", err)
+	}
+	// Overwrite k1 with shorter value and check UsedBytes adjusts accurately.
+	if err := c.Put("k1", []byte("12345"), 0); err != nil {
+		t.Fatalf("overwrite k1: %v", err)
+	}
+	if st := c.Stats(); st.Entries != 2 || st.UsedBytes != 15 {
+		t.Fatalf("expected 2 entries / 15 used bytes after overwrite, got %+v", st)
+	}
+
+	// Corrupt only k2; Scrub must remove k2 and keep k1 intact.
+	if err := c.CorruptFileForTest("k2"); err != nil {
+		t.Fatalf("corrupt k2: %v", err)
+	}
+	corrupted := c.Scrub()
+	if len(corrupted) != 1 || corrupted[0] != "k2" {
+		t.Fatalf("expected Scrub to report [k2], got %v", corrupted)
+	}
+	if got, hit, err := c.Get("k1"); err != nil || !hit || string(got) != "12345" {
+		t.Fatalf("expected k1 intact after scrub, hit=%v err=%v got=%q", hit, err, string(got))
+	}
+	if _, hit, _ := c.Get("k2"); hit {
+		t.Fatalf("expected k2 purged after scrub")
+	}
+}

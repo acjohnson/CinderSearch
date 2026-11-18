@@ -57,3 +57,40 @@ func TestSegmentBuildMarshalAndBitRotDetection(t *testing.T) {
 		t.Fatalf("expected ErrMismatch on corrupted segment index, got %v", err)
 	}
 }
+
+func TestSegmentTombstonesDedupAndFlattening(t *testing.T) {
+	docs := []InputDoc{
+		// Earlier version of d1 should be superseded by Seq 3 delete tombstone
+		{DocID: "d1", Seq: 1, RawJSON: []byte(`{"service":"auth","ok":true}`)},
+		{DocID: "d2", Seq: 2, RawJSON: []byte(`{"service":"billing","ok":false,"tags":["prod","eu"],"nested":{"code":200,"region":"eu-west"}}`)},
+		{DocID: "d1", Seq: 3, Deleted: true},
+	}
+
+	seg, _, docsBytes, err := Build("seg-tomb", "orders", 1, docs, "k.idx", "k.docs")
+	if err != nil {
+		t.Fatalf("build segment: %v", err)
+	}
+	if seg.LiveDocs != 1 {
+		t.Fatalf("expected 1 live doc (d2), got %d", seg.LiveDocs)
+	}
+	if seg.Tombstones["d1"] != 3 {
+		t.Fatalf("expected tombstone seq=3 for d1, got %+v", seg.Tombstones)
+	}
+	if len(seg.Docs) != 1 || seg.Docs[0].DocID != "d2" {
+		t.Fatalf("expected only d2 in Docs, got %+v", seg.Docs)
+	}
+	if len(docsBytes) != int(seg.Docs[0].Length) {
+		t.Fatalf("docs blob should omit deleted doc bytes")
+	}
+
+	dv := seg.DocVals[0]
+	if dv.Numbers["nested.code"] != 200 || dv.Bools["ok"] != false {
+		t.Fatalf("unexpected flattened nested/bool DocValues: %+v", dv)
+	}
+	if len(dv.Keywords["tags"]) != 2 || dv.Keywords["nested.region"][0] != "eu-west" {
+		t.Fatalf("unexpected array/nested keyword DocValues: %+v", dv.Keywords)
+	}
+	if _, err := Build("bad", "orders", 0, []InputDoc{{DocID: "x", Seq: 1, RawJSON: []byte(`{bad json`)}}, "", ""); err == nil {
+		t.Fatalf("expected error on invalid JSON document")
+	}
+}

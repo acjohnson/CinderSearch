@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -522,7 +523,16 @@ func (n *Node) GetDoc(ctx context.Context, indexName, docID, routing string) ([]
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, false, 0, nil, err
 	}
-	return parsed.Source, parsed.Found, 0, parsed.S3Pointer, nil
+	var crc uint32
+	if parsed.CRC32C != "" {
+		if v, err := strconv.ParseUint(parsed.CRC32C, 16, 32); err == nil {
+			crc = uint32(v)
+		}
+	}
+	if crc == 0 && len(parsed.Source) > 0 {
+		crc = checksum.Sum32C(parsed.Source)
+	}
+	return parsed.Source, parsed.Found, crc, parsed.S3Pointer, nil
 }
 
 func (n *Node) getLocalDoc(ctx context.Context, indexName string, shardID int, docID string) ([]byte, bool, uint32, *S3Pointer, error) {

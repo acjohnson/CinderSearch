@@ -87,3 +87,45 @@ func TestS3PutRangeAndZeroHopPresignedFetch(t *testing.T) {
 		t.Fatalf("expected ErrMismatch on corrupted S3 object, got %v", err)
 	}
 }
+
+func TestS3ListDeleteAndNotFound(t *testing.T) {
+	srv := NewMockServer("ak-list", "sk-list", "us-east-1")
+	defer srv.Close()
+
+	client, err := NewClient(Config{
+		Endpoint:  srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-list",
+		AccessKey: "ak-list",
+		SecretKey: "sk-list",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	ctx := context.Background()
+	_, _ = client.PutObject(ctx, "idx-a/shard-0/seg-1.idx", []byte("alpha"))
+	_, _ = client.PutObject(ctx, "idx-a/shard-0/seg-2.idx", []byte("beta"))
+	_, _ = client.PutObject(ctx, "idx-b/shard-0/seg-1.idx", []byte("gamma"))
+
+	objs, err := client.ListObjects(ctx, "idx-a/")
+	if err != nil {
+		t.Fatalf("list objects: %v", err)
+	}
+	if len(objs) != 2 || objs[0].Key != "idx-a/shard-0/seg-1.idx" || objs[1].Key != "idx-a/shard-0/seg-2.idx" {
+		t.Fatalf("unexpected list result: %+v", objs)
+	}
+
+	if err := client.DeleteObject(ctx, "idx-a/shard-0/seg-1.idx"); err != nil {
+		t.Fatalf("delete object: %v", err)
+	}
+	if _, _, err := client.GetObject(ctx, "idx-a/shard-0/seg-1.idx"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after delete, got %v", err)
+	}
+	if _, err := client.GetObjectRange(ctx, "idx-a/shard-0/seg-1.idx", 0, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound on range get of deleted object, got %v", err)
+	}
+	if _, err := client.GetObjectRange(ctx, "idx-a/shard-0/seg-2.idx", 5, 2); err == nil {
+		t.Fatalf("expected error on inverted byte range 5-2")
+	}
+}

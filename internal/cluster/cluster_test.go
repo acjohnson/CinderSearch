@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cindersearch/cindersearch/internal/api"
+	"github.com/cindersearch/cindersearch/internal/cache"
 	"github.com/cindersearch/cindersearch/internal/checksum"
 	"github.com/cindersearch/cindersearch/internal/cluster"
+	"github.com/cindersearch/cindersearch/internal/query"
 	"github.com/cindersearch/cindersearch/internal/s3store"
 	"github.com/cindersearch/cindersearch/internal/sharding"
 )
@@ -218,5 +222,368 @@ func TestThreeNodeClusterESCompatAsyncRepZeroHopAndBitRotHeal(t *testing.T) {
 	if totalHealed < 1 {
 		t.Fatalf("expected BitRotHealed >= 1 after NVMe corruption, got %d", totalHealed)
 	}
-	_ = context.Background()
+}
+
+func TestShardVersioningDeletesAndWALRecovery(t *testing.T) {
+	ctx := context.Background()
+	s3Srv := s3store.NewMockServer("ak-rec", "sk-rec", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-recovery",
+		AccessKey: "ak-rec",
+		SecretKey: "sk-rec",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	nvmeDir := t.TempDir()
+	nvmeCache, err := cache.NewNVMeCache(t.TempDir(), 32*1024*1024)
+	if err != nil {
+		t.Fatalf("new nvme cache: %v", err)
+	}
+
+	sh, err := cluster.OpenShard(ctx, "orders", 0, true, nvmeDir, nvmeCache, s3Client)
+	if err != nil {
+		t.Fatalf("open shard: %v", err)
+	}
+
+	// 1. Index v1 of doc-1 and doc-keep, then flush seg-000001 to S3.
+	if _, err := sh.IndexLocal("doc-1", []byte(`{"status":"open","step":1}`)); err != nil {
+		t.Fatalf("index v1: %v", err)
+	}
+	if _, err := sh.IndexLocal("doc-keep", []byte(`{"status":"archived","step":10}`)); err != nil {
+		t.Fatalf("index doc-keep: %v", err)
+	}
+	if ref, err := sh.FlushToS3(ctx); err != nil || ref == nil {
+		t.Fatalf("flush seg-1: ref=%v err=%v", ref, err)
+	}
+
+	// 2. Update doc-1 to v2 in WAL (not flushed yet); verify NRT segment suppresses v1.
+	if _, err := sh.IndexLocal("doc-1", []byte(`{"status":"closed","step":2}`)); err != nil {
+		t.Fatalf("index v2: %v", err)
+	}
+	segs, latestSeq, err := sh.ActiveSegments(ctx)
+	if err != nil {
+		t.Fatalf("active segments: %v", err)
+	}
+	openHits := 0
+	for _, seg := range segs {
+		hits, err := query.EvaluateSegment(seg, map[string]any{"term": map[string]any{"status": "open"}})
+		if err != nil {
+			t.Fatalf("eval open: %v", err)
+		}
+		for _, h := range hits {
+			if seg.Docs[h.DocIdx].Seq >= latestSeq[h.DocID] {
+				openHits++
+			}
+		}
+	}
+	if openHits != 0 {
+		t.Fatalf("expected stale v1 status=open to be suppressed, got %d hits", openHits)
+	}
+
+	// 3. Delete doc-1, flush tombstone segment seg-000002, then write doc-wal (unflushed).
+	if _, err := sh.DeleteLocal("doc-1"); err != nil {
+		t.Fatalf("delete doc-1: %v", err)
+	}
+	if _, err := sh.FlushToS3(ctx); err != nil {
+		t.Fatalf("flush tombstone seg-2: %v", err)
+	}
+	if _, err := sh.IndexLocal("doc-wal", []byte(`{"status":"pending","step":3}`)); err != nil {
+		t.Fatalf("index doc-wal: %v", err)
+	}
+	_ = sh.Close()
+
+	// 4. Crash recovery simulation: open shard against a fresh NVMeCache (cold cache) + existing NVMe WAL + S3 manifest.
+	freshCache, err := cache.NewNVMeCache(t.TempDir(), 32*1024*1024)
+	if err != nil {
+		t.Fatalf("new fresh cache: %v", err)
+	}
+	reopened, err := cluster.OpenShard(ctx, "orders", 0, true, nvmeDir, freshCache, s3Client)
+	if err != nil {
+		t.Fatalf("reopen shard: %v", err)
+	}
+	defer reopened.Close()
+
+	// doc-1 must remain deleted via S3 tombstone seg-2.
+	if _, found, _, _, _, err := reopened.GetDocByID(ctx, "doc-1"); err != nil || found {
+		t.Fatalf("expected doc-1 deleted after recovery, found=%v err=%v", found, err)
+	}
+	// doc-keep must hydrate from S3 seg-1 via fresh NVMe cache.
+	rawKeep, found, _, _, _, err := reopened.GetDocByID(ctx, "doc-keep")
+	if err != nil || !found || !bytes.Contains(rawKeep, []byte("archived")) {
+		t.Fatalf("expected doc-keep recovered from S3, found=%v err=%v raw=%s", found, err, string(rawKeep))
+	}
+	// doc-wal must replay from NVMe WAL.
+	rawWAL, found, _, _, _, err := reopened.GetDocByID(ctx, "doc-wal")
+	if err != nil || !found || !bytes.Contains(rawWAL, []byte("pending")) {
+		t.Fatalf("expected doc-wal replayed from WAL, found=%v err=%v raw=%s", found, err, string(rawWAL))
+	}
+}
+
+func TestClusterReplicaFailoverOnPrimaryOutage(t *testing.T) {
+	ctx := context.Background()
+	s3Srv := s3store.NewMockServer("ak-fo", "sk-fo", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-failover",
+		AccessKey: "ak-fo",
+		SecretKey: "sk-fo",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	nodes := make([]*cluster.Node, 3)
+	httpSrvs := make([]*httptest.Server, 3)
+	peers := make([]sharding.NodeInfo, 3)
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("node-%d", i+1)
+		n, err := cluster.NewNode(cluster.NodeConfig{
+			NodeID:            id,
+			NVMeDir:           t.TempDir(),
+			NVMeMaxBytes:      32 * 1024 * 1024,
+			FlushInterval:     30 * time.Second,
+			ReplicateInterval: 10 * time.Millisecond,
+			ScrubInterval:     30 * time.Second,
+			S3:                s3Client,
+		})
+		if err != nil {
+			t.Fatalf("new node: %v", err)
+		}
+		nodes[i] = n
+		httpSrvs[i] = httptest.NewServer(api.NewHandler(n))
+		peers[i] = sharding.NodeInfo{
+			ID:      id,
+			Address: strings.TrimPrefix(httpSrvs[i].URL, "http://"),
+		}
+	}
+	for _, n := range nodes {
+		n.UpdatePeers(peers)
+	}
+
+	if err := nodes[0].CreateIndex(ctx, cluster.IndexMetadata{
+		Name:     "events",
+		Settings: cluster.IndexSettings{NumberOfShards: 3, NumberOfReplicas: 1},
+	}, true); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+
+	for i := 0; i < 12; i++ {
+		docID := fmt.Sprintf("ev-%02d", i)
+		payload := fmt.Sprintf(`{"seq":%d,"msg":"failover check %d"}`, i, i)
+		if _, _, _, _, err := nodes[0].IndexDoc(ctx, "events", docID, []byte(payload), ""); err != nil {
+			t.Fatalf("index %s: %v", docID, err)
+		}
+	}
+
+	// Wait until async WAL replication delivers all 12 records across replicas.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var batches int64
+		for _, n := range nodes {
+			batches += n.Stats().ReplicationBatchesSent
+		}
+		if batches >= 3 {
+			// Verify replica searches see all 12 docs after refresh.
+			_ = nodes[0].RefreshIndex(ctx, "events", false, true)
+			res, err := nodes[1].Search(ctx, []string{"events"}, query.SearchRequest{
+				Query: map[string]any{"match_all": map[string]any{}},
+			}, cluster.RetrievalDropIn)
+			if err == nil {
+				total := int(res["hits"].(map[string]any)["total"].(map[string]any)["value"].(int))
+				if total == 12 {
+					break
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Terminate node-1 (primary for at least one shard) and close its HTTP listener.
+	httpSrvs[0].Close()
+	_ = nodes[0].Close()
+	defer func() {
+		httpSrvs[1].Close()
+		httpSrvs[2].Close()
+		_ = nodes[1].Close()
+		_ = nodes[2].Close()
+	}()
+
+	// Search from surviving node-2: failed primary shards must transparently fail over to replicas.
+	res, err := nodes[1].Search(ctx, []string{"events"}, query.SearchRequest{
+		Query: map[string]any{"match_all": map[string]any{}},
+	}, cluster.RetrievalDropIn)
+	if err != nil {
+		t.Fatalf("search after primary outage failed: %v", err)
+	}
+	total := res["hits"].(map[string]any)["total"].(map[string]any)["value"].(int)
+	if total != 12 {
+		t.Fatalf("expected all 12 hits via replica failover, got %d (shards=%+v)", total, res["_shards"])
+	}
+}
+
+func TestBackgroundFlushAndNVMeScrubLoops(t *testing.T) {
+	ctx := context.Background()
+	s3Srv := s3store.NewMockServer("ak-bg", "sk-bg", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-bg",
+		AccessKey: "ak-bg",
+		SecretKey: "sk-bg",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	n, err := cluster.NewNode(cluster.NodeConfig{
+		NodeID:            "node-bg",
+		NVMeDir:           t.TempDir(),
+		NVMeMaxBytes:      32 * 1024 * 1024,
+		FlushInterval:     40 * time.Millisecond,
+		ReplicateInterval: 40 * time.Millisecond,
+		ScrubInterval:     40 * time.Millisecond,
+		S3:                s3Client,
+	})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	defer n.Close()
+
+	if err := n.CreateIndex(ctx, cluster.IndexMetadata{
+		Name:     "bgidx",
+		Settings: cluster.IndexSettings{NumberOfShards: 1, NumberOfReplicas: 0},
+	}, false); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+
+	if _, _, _, _, err := n.IndexDoc(ctx, "bgidx", "d-1", []byte(`{"service":"worker","ok":true}`), ""); err != nil {
+		t.Fatalf("index doc: %v", err)
+	}
+
+	// Wait for background flushLoop to persist to S3 automatically.
+	var idxKey string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := n.Stats()
+		if st.S3SegmentFlushes >= 1 && len(st.Shards) == 1 && st.Shards[0].SegmentCount >= 1 {
+			idxKey = st.Shards[0].Segments[0].IdxKey
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if idxKey == "" {
+		t.Fatalf("background flushLoop did not flush segment to S3 in time: %+v", n.Stats())
+	}
+
+	// Corrupt cached segment index on NVMe and verify background scrubLoop purges it without a query.
+	if err := n.NVMeCache().CorruptFileForTest(idxKey); err != nil {
+		t.Fatalf("corrupt cached idx: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if n.NVMeCache().Stats().BitRotHealed >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n.NVMeCache().Stats().BitRotHealed < 1 {
+		t.Fatalf("background scrubLoop did not detect NVMe bit-rot in time: %+v", n.NVMeCache().Stats())
+	}
+}
+
+func TestConcurrentIngestFlushAndSearchRaceSafe(t *testing.T) {
+	ctx := context.Background()
+	s3Srv := s3store.NewMockServer("ak-race", "sk-race", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-race",
+		AccessKey: "ak-race",
+		SecretKey: "sk-race",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	n, err := cluster.NewNode(cluster.NodeConfig{
+		NodeID:            "node-race",
+		NVMeDir:           t.TempDir(),
+		NVMeMaxBytes:      32 * 1024 * 1024,
+		FlushInterval:     25 * time.Millisecond,
+		ReplicateInterval: 25 * time.Millisecond,
+		ScrubInterval:     30 * time.Millisecond,
+		S3:                s3Client,
+	})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	defer n.Close()
+
+	if err := n.CreateIndex(ctx, cluster.IndexMetadata{
+		Name:     "racetest",
+		Settings: cluster.IndexSettings{NumberOfShards: 3, NumberOfReplicas: 0},
+	}, false); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	// 4 concurrent writers
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 15; i++ {
+				id := fmt.Sprintf("w%d-%d", worker, i)
+				body := fmt.Sprintf(`{"worker":%d,"seq":%d,"message":"concurrent write test"}`, worker, i)
+				if _, _, _, _, err := n.IndexDoc(ctx, "racetest", id, []byte(body), ""); err != nil {
+					t.Errorf("concurrent index %s: %v", id, err)
+				}
+			}
+		}(w)
+	}
+	// 2 concurrent searchers + flushers
+	for s := 0; s < 2; s++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				_, err := n.Search(ctx, []string{"racetest"}, query.SearchRequest{
+					Query: map[string]any{"match": map[string]any{"message": "concurrent"}},
+				}, cluster.RetrievalHybrid)
+				if err != nil {
+					t.Errorf("concurrent search: %v", err)
+				}
+				_ = n.RefreshIndex(ctx, "racetest", i%3 == 0, false)
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := n.RefreshIndex(ctx, "racetest", true, false); err != nil {
+		t.Fatalf("final flush: %v", err)
+	}
+	res, err := n.Search(ctx, []string{"racetest"}, query.SearchRequest{
+		Query: map[string]any{"match_all": map[string]any{}},
+		Size:  func() *int { v := 100; return &v }(),
+	}, cluster.RetrievalDropIn)
+	if err != nil {
+		t.Fatalf("final search: %v", err)
+	}
+	if got := res["hits"].(map[string]any)["total"].(map[string]any)["value"].(int); got != 60 {
+		t.Fatalf("expected 60 total docs after concurrent ingest, got %d", got)
+	}
 }

@@ -1,0 +1,127 @@
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $entryComponent := ternary "coordinator" "data" (and .Values.coordinator.enabled (gt (int .Values.coordinator.replicaCount) 0)) -}}
+# Main Elasticsearch/OpenSearch-compatible client entrypoint.
+# Automatically targets stateless coordinators when enabled, otherwise targets multi-master data nodes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" $entryComponent) | nindent 4 }}
+---
+# Direct service for data nodes (useful for direct bulk ingest or admin inspection when coordinators are enabled)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "data") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "data") | nindent 4 }}
+---
+# Headless service for deterministic data StatefulSet pod DNS names in --peers
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-data-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "data") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.engine.listenPort }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "data") | nindent 4 }}
+{{- if and .Values.coordinator.enabled (gt (int .Values.coordinator.replicaCount) 0) }}
+---
+# Headless service for deterministic coordinator StatefulSet pod DNS names in --peers
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-coordinator-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.engine.listenPort }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
+{{- end }}
+{{- if and .Values.reader.enabled (gt (int .Values.reader.replicaCount) 0) }}
+---
+# Headless service for deterministic reader StatefulSet pod DNS names in --peers
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-reader-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "reader") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.engine.listenPort }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "reader") | nindent 4 }}
+{{- if .Values.service.readerService.enabled }}
+---
+# Dedicated client service targeting stateless S3+NVMe reader pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "reader") | nindent 4 }}
+  {{- with .Values.service.readerService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.readerService.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.readerService.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "reader") | nindent 4 }}
+{{- end }}
+{{- end }}

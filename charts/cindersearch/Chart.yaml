@@ -1,0 +1,17 @@
+apiVersion: v2
+name: cindersearch
+description: Production Helm chart for CinderSearch — S3-first, NVMe-cached, role-aware Elasticsearch/OpenSearch-compatible search engine.
+type: application
+version: 0.1.0
+appVersion: "8.11.0"
+home: https://github.com/cindersearch/cindersearch
+keywords:
+  - cindersearch
+  - elasticsearch
+  - opensearch
+  - search
+  - s3
+  - minio
+  - nvme
+maintainers:
+  - name: CinderSearch Contributors

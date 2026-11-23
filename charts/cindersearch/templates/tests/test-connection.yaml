@@ -1,0 +1,64 @@
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $expectedDataNodes := int .Values.data.replicaCount -}}
+{{- $expectedTotalNodes := $expectedDataNodes -}}
+{{- if .Values.coordinator.enabled -}}
+{{- $expectedTotalNodes = add $expectedTotalNodes (int .Values.coordinator.replicaCount) -}}
+{{- end -}}
+{{- if .Values.reader.enabled -}}
+{{- $expectedTotalNodes = add $expectedTotalNodes (int .Values.reader.replicaCount) -}}
+{{- end -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $fullname }}-test-connection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+  containers:
+    - name: verify-cluster
+      image: curlimages/curl:8.10.1
+      command:
+        - /bin/sh
+        - -eu
+        - -c
+        - |
+          BASE="http://{{ $fullname }}:{{ .Values.service.port }}"
+          echo "1. Checking cluster root banner..."
+          curl -fsS "${BASE}/" | grep -q "cindersearch-cluster"
+
+          echo "2. Checking /_cluster/health..."
+          HEALTH="$(curl -fsS "${BASE}/_cluster/health?pretty=false")"
+          echo "${HEALTH}"
+          echo "${HEALTH}" | grep -q '"status":"green"'
+          echo "${HEALTH}" | grep -q '"number_of_data_nodes":{{ $expectedDataNodes }}'
+          echo "${HEALTH}" | grep -q '"number_of_nodes":{{ $expectedTotalNodes }}'
+
+          echo "3. Checking /_nodes..."
+          curl -fsS "${BASE}/_nodes?pretty=false" | grep -q '"failed":0'
+
+          echo "4. Smoke testing index create -> bulk ingest -> flush -> search -> delete..."
+          IDX="helm-smoke-$(date +%s)"
+          curl -fsS -X PUT "${BASE}/${IDX}" -H 'Content-Type: application/json' \
+            -d '{"settings":{"number_of_shards":2,"number_of_replicas":1}}' >/dev/null
+          printf '{"index":{"_id":"smoke-1"}}\n{"service":"helm-test","ok":true,"msg":"cindersearch kubernetes smoke check"}\n' | \
+            curl -fsS -X POST "${BASE}/${IDX}/_bulk" -H 'Content-Type: application/x-ndjson' --data-binary @- >/dev/null
+          curl -fsS -X POST "${BASE}/${IDX}/_refresh?flush=true" >/dev/null
+          curl -fsS -X POST "${BASE}/${IDX}/_search?pretty=false" -H 'Content-Type: application/json' \
+            -d '{"query":{"match":{"msg":"smoke"}}}' | grep -q '"smoke-1"'
+          curl -fsS -X DELETE "${BASE}/${IDX}" >/dev/null
+          echo "All CinderSearch Helm smoke checks passed!"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL

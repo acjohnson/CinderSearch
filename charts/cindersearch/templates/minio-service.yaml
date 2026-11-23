@@ -1,0 +1,40 @@
+{{- if eq .Values.s3.mode "minio" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cindersearch.minio.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  type: {{ .Values.s3.minio.service.type }}
+  ports:
+    - name: s3-api
+      port: {{ .Values.s3.minio.service.port }}
+      targetPort: s3-api
+      protocol: TCP
+    - name: console
+      port: {{ .Values.s3.minio.service.consolePort }}
+      targetPort: console
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "minio") | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cindersearch.minio.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: s3-api
+      port: {{ .Values.s3.minio.service.port }}
+      targetPort: s3-api
+      protocol: TCP
+  selector:
+    {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "minio") | nindent 4 }}
+{{- end }}

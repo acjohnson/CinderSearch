@@ -1,0 +1,36 @@
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $totalNodes := int .Values.data.replicaCount -}}
+{{- if .Values.coordinator.enabled }}{{- $totalNodes = add $totalNodes (int .Values.coordinator.replicaCount) }}{{- end -}}
+{{- if .Values.reader.enabled }}{{- $totalNodes = add $totalNodes (int .Values.reader.replicaCount) }}{{- end -}}
+CinderSearch has been deployed!
+
+  Release:      {{ .Release.Name }}
+  Namespace:    {{ .Release.Namespace }}
+  Topology:     {{ .Values.cluster.topology }} ({{ $totalNodes }} total pods)
+    - data (multi-master shard/WAL owners): {{ .Values.data.replicaCount }}
+    - coordinator (stateless HTTP router):  {{ ternary .Values.coordinator.replicaCount 0 .Values.coordinator.enabled }}
+    - reader (stateless S3+NVMe search):    {{ ternary .Values.reader.replicaCount 0 .Values.reader.enabled }}
+  S3 Backend:   {{ .Values.s3.mode }}{{- if ne .Values.s3.mode "embedded" }} ({{ include "cindersearch.s3Endpoint" . }} / bucket={{ .Values.s3.bucket }}){{- end }}
+
+1. Connect to CinderSearch locally via port-forward:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 9200:{{ .Values.service.port }}
+
+2. Verify cluster health and node roles:
+   curl http://127.0.0.1:9200/
+   curl http://127.0.0.1:9200/_cluster/health
+   curl http://127.0.0.1:9200/_cat/nodes
+
+3. Run the built-in Helm smoke test (create index -> bulk -> S3 flush -> search -> delete):
+   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- if and .Values.reader.enabled (gt (int .Values.reader.replicaCount) 0) }}
+
+4. Route flushed search queries to stateless reader pods:
+   curl -X POST 'http://127.0.0.1:9200/logs/_search?preference=reader' \
+     -H 'Content-Type: application/json' -d '{"query":{"match_all":{}}}'
+{{- end }}
+{{- if eq .Values.s3.mode "minio" }}
+
+Bundled MinIO S3 Server ({{ .Values.s3.minio.mode }}):
+  S3 API:  {{ include "cindersearch.s3Endpoint" . }}
+  Console: kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "cindersearch.minio.fullname" . }} 9001:{{ .Values.s3.minio.service.consolePort }}
+{{- end }}

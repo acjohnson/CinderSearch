@@ -1,0 +1,158 @@
+{{- include "cindersearch.validateValues" . -}}
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $peers := include "cindersearch.peers" . -}}
+{{- $s3Endpoint := include "cindersearch.s3Endpoint" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "data") | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-data-headless
+  replicas: {{ .Values.data.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "data") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cindersearch.componentLabels" (dict "root" . "component" "data") | nindent 8 }}
+        {{- with .Values.data.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.data.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cindersearch.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.data.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: cindersearch
+          image: {{ include "cindersearch.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --node-id=$(POD_NAME)
+            - --roles={{ join "," .Values.data.roles }}
+            - --listen=:{{ .Values.engine.listenPort }}
+            - --peers={{ $peers }}
+            - --nvme-dir={{ .Values.data.nvmeDir }}
+            - --nvme-max-mb={{ .Values.data.nvmeMaxMB }}
+            - --flush-sec={{ .Values.engine.flushSec }}
+            - --s3-bucket={{ .Values.s3.bucket }}
+            - --s3-region={{ .Values.s3.region }}
+            {{- if eq .Values.s3.mode "embedded" }}
+            - --embedded-s3
+            {{- else }}
+            - --s3-endpoint={{ $s3Endpoint }}
+            {{- end }}
+            {{- if .Values.engine.pprof.enabled }}
+            - --pprof={{ .Values.engine.pprof.bindAddress }}:{{ .Values.engine.pprof.port }}
+            {{- else }}
+            - --pprof=
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if ne .Values.s3.mode "embedded" }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ include "cindersearch.s3AccessKeySecretKey" . }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ include "cindersearch.s3SecretKeySecretKey" . }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.engine.listenPort }}
+              protocol: TCP
+            {{- if .Values.engine.pprof.enabled }}
+            - name: pprof
+              containerPort: {{ .Values.engine.pprof.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.data.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.data.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.data.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.data.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.data.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.data.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: http
+            initialDelaySeconds: {{ .Values.data.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.data.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.data.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.data.readinessProbe.failureThreshold }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.data.resources | nindent 12 }}
+          volumeMounts:
+            - name: nvme-data
+              mountPath: {{ .Values.data.nvmeDir }}
+            - name: tmp
+              mountPath: /tmp
+      {{- with .Values.data.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.data.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $affinity := include "cindersearch.poolAffinity" (dict "root" . "component" "data" "antiAffinity" .Values.data.antiAffinity "custom" .Values.data.affinity) }}
+      {{- if $affinity }}
+      affinity:
+        {{- $affinity | nindent 8 }}
+      {{- end }}
+      {{- with .Values.data.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.data.persistence.enabled }}
+        - name: nvme-data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.data.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: nvme-data
+      spec:
+        accessModes:
+          {{- toYaml .Values.data.persistence.accessModes | nindent 10 }}
+        {{- if .Values.data.persistence.storageClass }}
+        storageClassName: {{ .Values.data.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.data.persistence.size | quote }}
+  {{- end }}

@@ -107,3 +107,25 @@ curl -X POST 'http://localhost:9200/logs/_search?retrieval=presigned' -H 'Conten
   "query": { "match_all": {} }
 }'
 ```
+
+## Kubernetes Deployment (Helm Chart)
+
+A production Helm chart lives in `charts/cindersearch` (with container image build via `Dockerfile`), supporting single-node dev, multi-node leaderless multi-master clusters, and disaggregated `data` + `coordinator` + `reader` pools with either a bundled open-source **MinIO** server (`standalone` or 4-node `distributed`) or an external **AWS S3 / R2 / Ceph RGW** bucket.
+
+```bash
+# Multi-node leaderless multi-master cluster + 4-node distributed MinIO
+helm upgrade --install cindersearch ./charts/cindersearch \
+  -n cindersearch --create-namespace \
+  -f ./charts/cindersearch/examples/values-multimaster-minio.yaml
+
+# Disaggregated (data + coordinator + reader) backed by real AWS S3
+helm upgrade --install cindersearch ./charts/cindersearch \
+  -n cindersearch --create-namespace \
+  -f ./charts/cindersearch/examples/values-disaggregated-aws-s3.yaml
+
+# Validate chart & run in-cluster smoke test
+make helm-lint
+helm test cindersearch -n cindersearch
+```
+
+See `charts/cindersearch/README.md` for full configuration details.

@@ -1,0 +1,15 @@
+.git
+.aistudio
+.next
+node_modules
+bin
+charts
+app
+components
+hooks
+lib
+public
+*.pprof
+*.log
+.env
+.env.*

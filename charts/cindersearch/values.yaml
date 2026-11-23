@@ -1,0 +1,311 @@
+# Default values for CinderSearch.
+# Supports single-node dev, multi-node leaderless multi-master data clusters,
+# and disaggregated (data + coordinator + reader) topologies backed by either
+# a bundled open-source MinIO S3 server or an external AWS S3 / S3-compatible service.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/cindersearch/cindersearch
+  tag: "" # Defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+cluster:
+  # Deployment mode preset / intent (informational + validation):
+  # - multi-node:    Leaderless multi-master data nodes (default)
+  # - disaggregated: Multi-master data nodes + stateless coordinator + stateless reader pools
+  # - single:        Single data node (dev/eval)
+  topology: multi-node
+  domain: cluster.local
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# ------------------------------------------------------------------------------
+# S3 Backend Configuration (embedded | minio | external)
+# ------------------------------------------------------------------------------
+s3:
+  # Mode:
+  # - minio:    Deploys an open-source MinIO S3-compatible server in-cluster
+  # - external: Connects to AWS S3, Cloudflare R2, Ceph RGW, or an external MinIO
+  # - embedded: Runs CinderSearch's built-in ephemeral S3 mock (single-node dev ONLY)
+  mode: minio
+  bucket: cindersearch
+  region: us-east-1
+
+  # Used when mode=external (if omitted, defaults to https://s3.<region>.amazonaws.com)
+  external:
+    endpoint: ""
+    accessKey: ""
+    secretKey: ""
+    # Reference an existing K8s Secret containing AWS_ACCESS_KEY_ID & AWS_SECRET_ACCESS_KEY
+    existingSecret: ""
+    accessKeySecretKey: AWS_ACCESS_KEY_ID
+    secretKeySecretKey: AWS_SECRET_ACCESS_KEY
+
+  # Bundled Open-Source MinIO S3-compatible server (when s3.mode=minio)
+  minio:
+    # Mode: standalone (1 pod) or distributed (4+ pods multi-node erasure coding)
+    mode: standalone
+    replicaCount: 4 # Used only when s3.minio.mode=distributed (must be >= 4)
+    image:
+      repository: minio/minio
+      tag: RELEASE.2024-10-13T13-34-11Z
+      pullPolicy: IfNotPresent
+    mcImage:
+      repository: minio/mc
+      tag: RELEASE.2024-10-13T17-01-47Z
+      pullPolicy: IfNotPresent
+    rootUser: cindersearch-minio
+    rootPassword: "" # Auto-generated random password if empty and existingSecret not set
+    existingSecret: ""
+    rootUserKey: AWS_ACCESS_KEY_ID
+    rootPasswordKey: AWS_SECRET_ACCESS_KEY
+    createBucketHook:
+      enabled: true
+      annotations: {}
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+    persistence:
+      enabled: true
+      storageClass: ""
+      accessModes:
+        - ReadWriteOnce
+      size: 50Gi
+    service:
+      type: ClusterIP
+      port: 9000
+      consolePort: 9001
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 2000m
+        memory: 2Gi
+    podDisruptionBudget:
+      enabled: false
+      minAvailable: 1
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
+# ------------------------------------------------------------------------------
+# Common Engine Flags
+# ------------------------------------------------------------------------------
+engine:
+  listenPort: 9200
+  flushSec: 5
+  pprof:
+    enabled: false
+    port: 6060
+    bindAddress: 127.0.0.1
+
+# ------------------------------------------------------------------------------
+# Pool 1: Data Nodes (Leaderless Multi-Master Shard & WAL Owners)
+# ------------------------------------------------------------------------------
+data:
+  replicaCount: 3
+  # Valid roles: data (default), or comma/list combination like ["data", "reader"]
+  roles:
+    - data
+  nvmeMaxMB: 1024
+  nvmeDir: /var/lib/cindersearch
+  terminationGracePeriodSeconds: 60
+
+  persistence:
+    enabled: true
+    storageClass: "" # Set to your NVMe/SSD StorageClass (e.g., gp3, local-nvme)
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  # Soft anti-affinity by default so 3 data pods spread across nodes when possible
+  antiAffinity: soft # soft | hard | none
+  affinity: {}
+  topologySpreadConstraints: []
+
+# ------------------------------------------------------------------------------
+# Pool 2: Coordinator Nodes (Stateless Query Router & Aggs Merger, Zero WAL)
+# ------------------------------------------------------------------------------
+coordinator:
+  enabled: false
+  replicaCount: 2
+  roles:
+    - coordinator
+  nvmeMaxMB: 64
+  nvmeDir: /var/lib/cindersearch
+  terminationGracePeriodSeconds: 30
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  antiAffinity: soft
+  affinity: {}
+
+# ------------------------------------------------------------------------------
+# Pool 3: Reader Nodes (Stateless S3 + NVMe Search Cache Pool, Zero WAL)
+# ------------------------------------------------------------------------------
+reader:
+  enabled: false
+  replicaCount: 2
+  roles:
+    - reader
+  nvmeMaxMB: 1024
+  nvmeDir: /var/lib/cindersearch
+  terminationGracePeriodSeconds: 30
+
+  # Readers hold zero WALs; ephemeral emptyDir on local NVMe or PVC are both supported
+  persistence:
+    enabled: false
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+  ephemeralCacheSizeLimit: 4Gi
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  antiAffinity: soft
+  affinity: {}
+
+# ------------------------------------------------------------------------------
+# Security Contexts
+# ------------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# ------------------------------------------------------------------------------
+# Services, Ingress & NetworkPolicy
+# ------------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9200
+  annotations: {}
+  # Dedicated service pointing strictly at reader pods when reader.enabled=true
+  readerService:
+    enabled: true
+    type: ClusterIP
+    port: 9200
+    annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: cindersearch.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+networkPolicy:
+  enabled: false
+  # Restrict API ingress to specific namespaces/CIDRs if desired (empty allows all ingress on 9200)
+  ingressFrom: []

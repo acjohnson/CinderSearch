@@ -1,0 +1,58 @@
+# Mode 2: Production multi-node leaderless multi-master data cluster + HA Distributed MinIO
+# Every data node is an equal multi-master peer in the consistent hash ring (no SPOF master election).
+# MinIO deploys 4 erasure-coded pods for durable in-cluster S3-compatible object storage.
+
+cluster:
+  topology: multi-node
+
+s3:
+  mode: minio
+  bucket: cindersearch
+  region: us-east-1
+  minio:
+    mode: distributed
+    replicaCount: 4
+    rootUser: cindersearch-minio
+    # Set via --set s3.minio.rootPassword=... or existingSecret in production
+    persistence:
+      enabled: true
+      size: 100Gi
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 3
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+
+data:
+  replicaCount: 3
+  roles:
+    - data
+  nvmeMaxMB: 2048
+  persistence:
+    enabled: true
+    size: 50Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  antiAffinity: soft
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+
+coordinator:
+  enabled: false
+
+reader:
+  enabled: false
+
+networkPolicy:
+  enabled: true

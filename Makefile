@@ -8,7 +8,7 @@ GO          ?= go
 GOFLAGS     ?=
 RACE_FLAG   := -race
 
-.PHONY: all build test test-v race bench bench-live profile-cpu profile-mem demo run fmt fmt-check vet lint tidy clean help
+.PHONY: all build test test-v race bench bench-live profile-cpu profile-mem demo run docker-build helm-lint helm-template fmt fmt-check vet lint tidy clean help
 
 all: vet test build
 
@@ -54,6 +54,24 @@ demo: build
 ## run: Build and start a local single-node CinderSearch server with embedded S3 on :9200
 run: build
 	./$(BINARY) serve --node-id node-1 --listen :9200 --embedded-s3 --nvme-dir /tmp/cindersearch-nvme
+
+## docker-build: Build production CinderSearch container image
+docker-build:
+	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t ghcr.io/cindersearch/cindersearch:$(VERSION) .
+
+## helm-lint: Validate the Kubernetes Helm chart and example topologies
+helm-lint:
+	helm lint ./charts/cindersearch
+	helm lint ./charts/cindersearch -f ./charts/cindersearch/examples/values-single-dev.yaml
+	helm lint ./charts/cindersearch -f ./charts/cindersearch/examples/values-multimaster-minio.yaml
+	helm lint ./charts/cindersearch -f ./charts/cindersearch/examples/values-disaggregated-aws-s3.yaml
+
+## helm-template: Render Helm manifests across all deployment presets
+helm-template:
+	helm template cindersearch ./charts/cindersearch -f ./charts/cindersearch/examples/values-single-dev.yaml >/dev/null
+	helm template cindersearch ./charts/cindersearch -f ./charts/cindersearch/examples/values-multimaster-minio.yaml >/dev/null
+	helm template cindersearch ./charts/cindersearch -f ./charts/cindersearch/examples/values-disaggregated-aws-s3.yaml >/dev/null
+	@echo "All Helm chart topologies rendered cleanly"
 
 ## fmt: Format all Go source files in-place (opt-in)
 fmt:

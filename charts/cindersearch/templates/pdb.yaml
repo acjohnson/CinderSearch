@@ -1,0 +1,45 @@
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- if and .Values.data.podDisruptionBudget.enabled (gt (int .Values.data.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "data") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.data.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "data") | nindent 6 }}
+{{- end }}
+{{- if and .Values.coordinator.enabled .Values.coordinator.podDisruptionBudget.enabled (gt (int .Values.coordinator.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-coordinator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.coordinator.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 6 }}
+{{- end }}
+{{- if and .Values.reader.enabled .Values.reader.podDisruptionBudget.enabled (gt (int .Values.reader.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "reader") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.reader.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "reader") | nindent 6 }}
+{{- end }}

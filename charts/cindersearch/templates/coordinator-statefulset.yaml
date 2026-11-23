@@ -1,0 +1,134 @@
+{{- if and .Values.coordinator.enabled (gt (int .Values.coordinator.replicaCount) 0) }}
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $peers := include "cindersearch.peers" . -}}
+{{- $s3Endpoint := include "cindersearch.s3Endpoint" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-coordinator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-coordinator-headless
+  replicas: {{ .Values.coordinator.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cindersearch.componentLabels" (dict "root" . "component" "coordinator") | nindent 8 }}
+        {{- with .Values.coordinator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.coordinator.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cindersearch.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.coordinator.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: cindersearch
+          image: {{ include "cindersearch.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --node-id=$(POD_NAME)
+            - --roles={{ join "," .Values.coordinator.roles }}
+            - --listen=:{{ .Values.engine.listenPort }}
+            - --peers={{ $peers }}
+            - --nvme-dir={{ .Values.coordinator.nvmeDir }}
+            - --nvme-max-mb={{ .Values.coordinator.nvmeMaxMB }}
+            - --flush-sec={{ .Values.engine.flushSec }}
+            - --s3-bucket={{ .Values.s3.bucket }}
+            - --s3-region={{ .Values.s3.region }}
+            - --s3-endpoint={{ $s3Endpoint }}
+            {{- if .Values.engine.pprof.enabled }}
+            - --pprof={{ .Values.engine.pprof.bindAddress }}:{{ .Values.engine.pprof.port }}
+            {{- else }}
+            - --pprof=
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ include "cindersearch.s3AccessKeySecretKey" . }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ include "cindersearch.s3SecretKeySecretKey" . }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.engine.listenPort }}
+              protocol: TCP
+            {{- if .Values.engine.pprof.enabled }}
+            - name: pprof
+              containerPort: {{ .Values.engine.pprof.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.coordinator.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.coordinator.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.coordinator.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.coordinator.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.coordinator.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.coordinator.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: http
+            initialDelaySeconds: {{ .Values.coordinator.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.coordinator.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.coordinator.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.coordinator.readinessProbe.failureThreshold }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+          volumeMounts:
+            - name: scratch
+              mountPath: {{ .Values.coordinator.nvmeDir }}
+            - name: tmp
+              mountPath: /tmp
+      {{- with .Values.coordinator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $affinity := include "cindersearch.poolAffinity" (dict "root" . "component" "coordinator" "antiAffinity" .Values.coordinator.antiAffinity "custom" .Values.coordinator.affinity) }}
+      {{- if $affinity }}
+      affinity:
+        {{- $affinity | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: tmp
+          emptyDir: {}
+{{- end }}

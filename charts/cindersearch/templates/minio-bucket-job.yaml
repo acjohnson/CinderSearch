@@ -1,0 +1,79 @@
+{{- if and (eq .Values.s3.mode "minio") .Values.s3.minio.createBucketHook.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "cindersearch.minio.fullname" . }}-init-bucket
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio-init") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- with .Values.s3.minio.createBucketHook.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "cindersearch.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: create-bucket
+          image: "{{ .Values.s3.minio.mcImage.repository }}:{{ .Values.s3.minio.mcImage.tag }}"
+          imagePullPolicy: {{ .Values.s3.minio.mcImage.pullPolicy }}
+          command:
+            - /bin/sh
+            - -eu
+            - -c
+            - |
+              export MC_CONFIG_DIR=/tmp/.mc
+              until mc alias set local "${S3_ENDPOINT}" "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" --api S3v4; do
+                echo "Waiting for MinIO at ${S3_ENDPOINT}..."
+                sleep 2
+              done
+              mc mb --ignore-existing "local/${S3_BUCKET}"
+              echo "Ensured bucket ${S3_BUCKET} exists on ${S3_ENDPOINT}"
+          env:
+            - name: S3_ENDPOINT
+              value: {{ include "cindersearch.s3Endpoint" . | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ .Values.s3.minio.rootUserKey }}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ .Values.s3.minio.rootPasswordKey }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.s3.minio.createBucketHook.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

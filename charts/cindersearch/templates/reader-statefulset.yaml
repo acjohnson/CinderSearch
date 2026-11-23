@@ -1,0 +1,152 @@
+{{- if and .Values.reader.enabled (gt (int .Values.reader.replicaCount) 0) }}
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $peers := include "cindersearch.peers" . -}}
+{{- $s3Endpoint := include "cindersearch.s3Endpoint" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "reader") | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-reader-headless
+  replicas: {{ .Values.reader.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "reader") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cindersearch.componentLabels" (dict "root" . "component" "reader") | nindent 8 }}
+        {{- with .Values.reader.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.reader.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cindersearch.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.reader.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: cindersearch
+          image: {{ include "cindersearch.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --node-id=$(POD_NAME)
+            - --roles={{ join "," .Values.reader.roles }}
+            - --listen=:{{ .Values.engine.listenPort }}
+            - --peers={{ $peers }}
+            - --nvme-dir={{ .Values.reader.nvmeDir }}
+            - --nvme-max-mb={{ .Values.reader.nvmeMaxMB }}
+            - --flush-sec={{ .Values.engine.flushSec }}
+            - --s3-bucket={{ .Values.s3.bucket }}
+            - --s3-region={{ .Values.s3.region }}
+            - --s3-endpoint={{ $s3Endpoint }}
+            {{- if .Values.engine.pprof.enabled }}
+            - --pprof={{ .Values.engine.pprof.bindAddress }}:{{ .Values.engine.pprof.port }}
+            {{- else }}
+            - --pprof=
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ include "cindersearch.s3AccessKeySecretKey" . }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ include "cindersearch.s3SecretKeySecretKey" . }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.engine.listenPort }}
+              protocol: TCP
+            {{- if .Values.engine.pprof.enabled }}
+            - name: pprof
+              containerPort: {{ .Values.engine.pprof.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.reader.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.reader.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.reader.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.reader.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.reader.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.reader.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: http
+            initialDelaySeconds: {{ .Values.reader.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.reader.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.reader.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.reader.readinessProbe.failureThreshold }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.reader.resources | nindent 12 }}
+          volumeMounts:
+            - name: nvme-cache
+              mountPath: {{ .Values.reader.nvmeDir }}
+            - name: tmp
+              mountPath: /tmp
+      {{- with .Values.reader.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.reader.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $affinity := include "cindersearch.poolAffinity" (dict "root" . "component" "reader" "antiAffinity" .Values.reader.antiAffinity "custom" .Values.reader.affinity) }}
+      {{- if $affinity }}
+      affinity:
+        {{- $affinity | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.reader.persistence.enabled }}
+        - name: nvme-cache
+          emptyDir:
+            {{- if .Values.reader.ephemeralCacheSizeLimit }}
+            sizeLimit: {{ .Values.reader.ephemeralCacheSizeLimit }}
+            {{- end }}
+        {{- end }}
+  {{- if .Values.reader.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: nvme-cache
+      spec:
+        accessModes:
+          {{- toYaml .Values.reader.persistence.accessModes | nindent 10 }}
+        {{- if .Values.reader.persistence.storageClass }}
+        storageClassName: {{ .Values.reader.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.reader.persistence.size | quote }}
+  {{- end }}
+{{- end }}

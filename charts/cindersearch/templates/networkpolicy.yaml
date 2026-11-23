@@ -1,0 +1,68 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "cindersearch.fullname" . -}}
+{{- $port := int .Values.engine.listenPort -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cindersearch.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Always allow intra-cluster peer RPCs (index sync, WAL replication, shard search, MinIO)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "cindersearch.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+        {{- if eq .Values.s3.mode "minio" }}
+        - protocol: TCP
+          port: {{ .Values.s3.minio.service.port }}
+        {{- end }}
+    # Client API access on the Elasticsearch HTTP port
+    - ports:
+        - protocol: TCP
+          port: {{ $port }}
+      {{- if .Values.networkPolicy.ingressFrom }}
+      from:
+        {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+      {{- end }}
+  egress:
+    # DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Intra-cluster peer RPCs & bundled MinIO
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "cindersearch.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+        {{- if eq .Values.s3.mode "minio" }}
+        - protocol: TCP
+          port: {{ .Values.s3.minio.service.port }}
+        {{- end }}
+    {{- if eq .Values.s3.mode "external" }}
+    # External S3 / S3-compatible object storage HTTPS/HTTP egress
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 9000
+    {{- end }}
+{{- end }}

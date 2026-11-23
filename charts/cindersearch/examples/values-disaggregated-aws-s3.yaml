@@ -1,0 +1,98 @@
+# Mode 3: Disaggregated multi-role production cluster backed by AWS S3 (or R2 / Ceph RGW / external MinIO)
+# - 3x multi-master data nodes (NVMe WAL + shard primaries/replicas + S3 flushing)
+# - 2x stateless coordinator nodes (HTTP entrypoint, Query DSL routing, global aggs/sort merge)
+# - 3x stateless reader nodes (horizontally scaled S3 + NVMe search cache, zero WALs)
+
+cluster:
+  topology: disaggregated
+
+serviceAccount:
+  create: true
+  # Optional: annotate for AWS IAM Roles for Service Accounts (IRSA), e.g.:
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/cindersearch-s3
+  annotations: {}
+
+s3:
+  mode: external
+  bucket: my-prod-cindersearch-bucket
+  region: us-east-1
+  external:
+    # Leave endpoint empty for standard AWS S3 (auto-resolves to https://s3.<region>.amazonaws.com),
+    # or set a custom URL for Cloudflare R2, Ceph RGW, or external MinIO.
+    endpoint: ""
+    # Pre-create a K8s Secret with keys AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    # kubectl create secret generic cindersearch-aws-creds \
+    #   --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
+    existingSecret: cindersearch-aws-creds
+
+data:
+  replicaCount: 3
+  roles:
+    - data
+  nvmeMaxMB: 4096
+  persistence:
+    enabled: true
+    # storageClass: gp3
+    size: 100Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  antiAffinity: hard
+  resources:
+    requests:
+      cpu: 2000m
+      memory: 4Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+
+coordinator:
+  enabled: true
+  replicaCount: 2
+  roles:
+    - coordinator
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  antiAffinity: soft
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+
+reader:
+  enabled: true
+  replicaCount: 3
+  roles:
+    - reader
+  nvmeMaxMB: 4096
+  persistence:
+    enabled: false
+  ephemeralCacheSizeLimit: 8Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  antiAffinity: soft
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: search.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+networkPolicy:
+  enabled: true

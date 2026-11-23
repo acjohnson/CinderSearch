@@ -1,0 +1,31 @@
+# Mode 1: Single-node local dev / evaluation (kind, minikube, k3d)
+# Uses CinderSearch's built-in ephemeral S3 mock (zero external dependencies).
+
+cluster:
+  topology: single
+
+s3:
+  mode: embedded
+  bucket: cindersearch-dev
+
+data:
+  replicaCount: 1
+  nvmeMaxMB: 256
+  persistence:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  antiAffinity: none
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+coordinator:
+  enabled: false
+
+reader:
+  enabled: false

@@ -29,6 +29,10 @@ const REPO_FILES: Array<{ path: string; category: string; summary: string }> = [
   { path: 'internal/cluster/node.go', category: 'Cluster & Sharding', summary: 'Cluster coordinator, async WAL replication loop, S3 flusher, scatter-gather' },
   { path: 'internal/api/es_server.go', category: 'Elasticsearch API', summary: 'Drop-in Elasticsearch / OpenSearch HTTP REST router and NDJSON _bulk parser' },
   { path: 'internal/cluster/cluster_test.go', category: 'Tests', summary: '3-node race integration test: _bulk, async WAL, zero-hop S3, bit-rot heal' },
+  { path: 'Dockerfile', category: 'Kubernetes & Helm', summary: 'Multi-stage non-root Alpine container build for CinderSearch' },
+  { path: 'charts/cindersearch/Chart.yaml', category: 'Kubernetes & Helm', summary: 'Helm v2 chart metadata for CinderSearch' },
+  { path: 'charts/cindersearch/values.yaml', category: 'Kubernetes & Helm', summary: 'Complete Helm values: multi-master data, coordinator, reader, MinIO & external S3' },
+  { path: 'charts/cindersearch/README.md', category: 'Kubernetes & Helm', summary: 'Kubernetes deployment guide for single, multi-master MinIO, and AWS S3 modes' },
 ];
 
 export async function GET() {

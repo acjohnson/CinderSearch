@@ -1,0 +1,129 @@
+{{- if eq .Values.s3.mode "minio" }}
+{{- $minioName := include "cindersearch.minio.fullname" . -}}
+{{- $isDistributed := eq .Values.s3.minio.mode "distributed" -}}
+{{- $replicas := ternary (int .Values.s3.minio.replicaCount) 1 $isDistributed -}}
+{{- $s3Port := int .Values.s3.minio.service.port -}}
+{{- $consolePort := int .Values.s3.minio.service.consolePort -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $minioName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  serviceName: {{ $minioName }}-headless
+  replicas: {{ $replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "cindersearch.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: minio
+          image: "{{ .Values.s3.minio.image.repository }}:{{ .Values.s3.minio.image.tag }}"
+          imagePullPolicy: {{ .Values.s3.minio.image.pullPolicy }}
+          args:
+            - server
+            {{- if $isDistributed }}
+            - {{ printf "http://%s-{0...%d}.%s-headless.%s.svc.%s:%d/data" $minioName (sub $replicas 1) $minioName .Release.Namespace .Values.cluster.domain $s3Port | quote }}
+            {{- else }}
+            - /data
+            {{- end }}
+            - --address
+            - {{ printf ":%d" $s3Port | quote }}
+            - --console-address
+            - {{ printf ":%d" $consolePort | quote }}
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ .Values.s3.minio.rootUserKey }}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cindersearch.s3SecretName" . }}
+                  key: {{ .Values.s3.minio.rootPasswordKey }}
+            - name: MINIO_SITE_REGION
+              value: {{ .Values.s3.region | quote }}
+          ports:
+            - name: s3-api
+              containerPort: {{ $s3Port }}
+              protocol: TCP
+            - name: console
+              containerPort: {{ $consolePort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3-api
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3-api
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.s3.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- with .Values.s3.minio.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.s3.minio.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.s3.minio.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.s3.minio.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.s3.minio.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.s3.minio.persistence.accessModes | nindent 10 }}
+        {{- if .Values.s3.minio.persistence.storageClass }}
+        storageClassName: {{ .Values.s3.minio.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.s3.minio.persistence.size | quote }}
+  {{- end }}
+{{- end }}

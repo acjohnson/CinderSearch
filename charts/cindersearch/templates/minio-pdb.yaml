@@ -1,0 +1,14 @@
+{{- if and (eq .Values.s3.mode "minio") .Values.s3.minio.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cindersearch.minio.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cindersearch.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.s3.minio.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "cindersearch.componentSelectorLabels" (dict "root" . "component" "minio") | nindent 6 }}
+{{- end }}

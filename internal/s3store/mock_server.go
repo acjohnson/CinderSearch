@@ -34,6 +34,7 @@ type MockServer struct {
 	secretKey string
 	region    string
 	server    *httptest.Server
+	faultFn   func(method, bucket, key string) (int, string)
 }
 
 // NewMockServer starts an embedded S3 HTTP test server on localhost.
@@ -65,6 +66,14 @@ func (m *MockServer) URL() string {
 // Close shuts down the embedded S3 HTTP server.
 func (m *MockServer) Close() {
 	m.server.Close()
+}
+
+// SetFaultInjector installs (or clears when nil) an HTTP fault hook for testing S3 outage resilience.
+// Returning a status >= 400 short-circuits the request with that HTTP status and message.
+func (m *MockServer) SetFaultInjector(fn func(method, bucket, key string) (int, string)) {
+	m.mu.Lock()
+	m.faultFn = fn
+	m.mu.Unlock()
 }
 
 // CorruptObject intentionally flips a bit in an S3 object for testing bit-rot resilience.
@@ -104,8 +113,22 @@ func (m *MockServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bucket := parts[0]
+	key := ""
+	if len(parts) == 2 {
+		key = parts[1]
+	}
 
-	if len(parts) == 1 || parts[1] == "" {
+	m.mu.RLock()
+	faultFn := m.faultFn
+	m.mu.RUnlock()
+	if faultFn != nil {
+		if status, msg := faultFn(r.Method, bucket, key); status >= 400 {
+			http.Error(w, msg, status)
+			return
+		}
+	}
+
+	if key == "" {
 		if r.Method == http.MethodGet {
 			m.handleList(w, r, bucket)
 			return
@@ -114,7 +137,6 @@ func (m *MockServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := parts[1]
 	switch r.Method {
 	case http.MethodPut:
 		m.handlePut(w, r, bucket, key)

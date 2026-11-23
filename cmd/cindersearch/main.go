@@ -117,27 +117,9 @@ func runServe(args []string) {
 		log.Fatalf("init s3 client: %v", err)
 	}
 
-	var peers []sharding.NodeInfo
-	if *peersFlag != "" {
-		for _, item := range strings.Split(*peersFlag, ",") {
-			kv := strings.SplitN(strings.TrimSpace(item), "=", 2)
-			if len(kv) == 2 {
-				addrAndRoles := strings.SplitN(kv[1], "@", 2)
-				var peerRoles []string
-				if len(addrAndRoles) == 2 && addrAndRoles[1] != "" {
-					parsed, rErr := sharding.NormalizeRoles(strings.Split(addrAndRoles[1], "+"))
-					if rErr != nil {
-						log.Fatalf("invalid peer %q roles: %v", kv[0], rErr)
-					}
-					peerRoles = parsed
-				}
-				peers = append(peers, sharding.NodeInfo{
-					ID:      kv[0],
-					Address: addrAndRoles[0],
-					Roles:   peerRoles,
-				})
-			}
-		}
+	peers, err := parsePeersFlag(*peersFlag)
+	if err != nil {
+		log.Fatalf("invalid --peers: %v", err)
 	}
 
 	node, err := cluster.NewNode(cluster.NodeConfig{
@@ -607,4 +589,41 @@ func benchPercentiles(durs []time.Duration) (p50, p95, p99 float64) {
 		return float64(cp[pos].Microseconds()) / 1000.0
 	}
 	return at(0.50), at(0.95), at(0.99)
+}
+
+func parsePeersFlag(raw string) ([]sharding.NodeInfo, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var peers []sharding.NodeInfo
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		kv := strings.SplitN(item, "=", 2)
+		if len(kv) != 2 || strings.TrimSpace(kv[0]) == "" || strings.TrimSpace(kv[1]) == "" {
+			return nil, fmt.Errorf("malformed peer entry %q (expected id=host:port[@role1+role2])", item)
+		}
+		id := strings.TrimSpace(kv[0])
+		addrAndRoles := strings.SplitN(strings.TrimSpace(kv[1]), "@", 2)
+		addr := strings.TrimSpace(addrAndRoles[0])
+		if addr == "" {
+			return nil, fmt.Errorf("missing address for peer %q", id)
+		}
+		var peerRoles []string
+		if len(addrAndRoles) == 2 && strings.TrimSpace(addrAndRoles[1]) != "" {
+			parsed, err := sharding.NormalizeRoles(strings.Split(addrAndRoles[1], "+"))
+			if err != nil {
+				return nil, fmt.Errorf("invalid peer %q roles: %w", id, err)
+			}
+			peerRoles = parsed
+		}
+		peers = append(peers, sharding.NodeInfo{
+			ID:      id,
+			Address: addr,
+			Roles:   peerRoles,
+		})
+	}
+	return peers, nil
 }

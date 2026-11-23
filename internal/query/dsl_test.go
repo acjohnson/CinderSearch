@@ -365,3 +365,28 @@ func BenchmarkQueryTermsAndStatsAggs1000Docs(b *testing.B) {
 		}
 	}
 }
+
+func FuzzQueryStringAndWildcard(f *testing.F) {
+	docs := []segment.InputDoc{
+		{DocID: "1", Seq: 1, RawJSON: []byte(`{"service":"checkout-api","message":"s3 range timeout on shard 2","latency_ms":412}`)},
+		{DocID: "2", Seq: 2, RawJSON: []byte(`{"service":"search-core","message":"nvme cache hit for inverted index","latency_ms":8}`)},
+	}
+	seg, _, _, err := segment.Build("seg-fuzz", "logs", 0, docs, "k.idx", "k.docs")
+	if err != nil {
+		f.Fatalf("build fuzz segment: %v", err)
+	}
+
+	f.Add("")
+	f.Add("*")
+	f.Add("***???***")
+	f.Add(`+message:"range timeout" -service:search*`)
+	f.Add(`"unterminated phrase`)
+	f.Add(`field:a*b?c :orphan +-`)
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		_, _ = EvaluateSegment(seg, map[string]any{"query_string": map[string]any{"query": raw}})
+		_, _ = EvaluateSegment(seg, map[string]any{"simple_query_string": map[string]any{"query": raw}})
+		_, _ = EvaluateSegment(seg, map[string]any{"wildcard": map[string]any{"service": raw}})
+		_, _ = EvaluateSegment(seg, map[string]any{"prefix": map[string]any{"service": raw}})
+	})
+}

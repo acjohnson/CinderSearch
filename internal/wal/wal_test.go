@@ -158,3 +158,21 @@ func BenchmarkWALAppendBuffered(b *testing.B) {
 func BenchmarkWALAppendFsync(b *testing.B) {
 	benchmarkWALAppend(b, true)
 }
+
+func FuzzWALReplayCorruptBytes(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte("CWAL\x00\x00\x00\x01"))
+	f.Add([]byte("CWAL\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"))
+	f.Add([]byte{0x43, 0x57, 0x41, 0x4c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+
+	path := filepath.Join(f.TempDir(), "fuzz.wal")
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatalf("write fuzz wal: %v", err)
+		}
+		w, err := Open(path, false)
+		if err == nil {
+			_ = w.Close()
+		}
+	})
+}

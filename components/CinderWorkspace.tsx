@@ -23,7 +23,9 @@ interface CinderWorkspaceProps {
 
 const MAKE_TARGETS = [
   { target: 'make build', desc: 'Compile zero-dependency Go binary to bin/cindersearch' },
-  { target: 'make test', desc: 'Run unit & 3-node integration tests with -race enabled' },
+  { target: 'make test', desc: 'Run unit, cold-boot, fault-injection & 3-node tests with -race' },
+  { target: 'make fuzz', desc: 'Run Go fuzz passes over WAL, Query DSL, and _bulk NDJSON' },
+  { target: 'make test-s3-integration', desc: 'Run build-tagged live AWS S3 / MinIO SigV4 & Range test' },
   { target: 'make demo', desc: 'Boot embedded S3 + 3-node cluster, test zero-hop Range & bit-rot heal' },
   { target: 'make run', desc: 'Start single-node Elasticsearch-compatible server on :9200' },
   { target: 'make bench', desc: 'Run Go microbenchmarks for CRC32C, NVMe, segment, and query HTTP' },
@@ -34,19 +36,24 @@ const MAKE_TARGETS = [
 
 const ES_COMPAT_MATRIX = [
   {
-    surface: 'Index & Cluster REST',
-    endpoints: 'GET /, GET /_cluster/health, GET /_nodes, GET /_cat/nodes, GET /_cat/indices, GET /_cat/shards, PUT/GET/DELETE /{index}, POST /{index}/_refresh',
-    notes: 'Pretty JSON by default (?pretty=false for compact), number_of_shards/replicas, and ?flush=true for S3 commit',
+    surface: 'Index, Mapping & Cluster REST',
+    endpoints: 'GET /, HEAD/PUT/GET/DELETE /{index}, GET/PUT /{index}/_mapping, GET/POST /_count, GET /_cluster/health, /_nodes, /_cat/{nodes,indices,shards}, POST /{index}/_refresh',
+    notes: 'X-Elastic-Product: Elasticsearch & ES v8 media-type negotiation, S3-persisted cold-boot cluster metadata (_cluster/indices/*.json)',
+  },
+  {
+    surface: 'Aliases & Wildcard Patterns',
+    endpoints: 'POST /_aliases, GET /_aliases, GET/HEAD /_alias/{name}, PUT/DELETE/GET/HEAD /{index}/_alias/{name}, logs-*,-logs-debug*, _all',
+    notes: 'Atomic add/remove alias swaps persisted to S3 and expanded across _search, _count, _mapping, and _refresh',
   },
   {
     surface: 'Node Roles & Routing',
     endpoints: '--roles=data|coordinator|reader, --peers=id=host:port[@role1+role2], ?preference=reader (X-Cinder-Preference)',
-    notes: 'Only data nodes own shard WALs; coordinators are stateless routers; readers serve flushed S3+NVMe queries',
+    notes: 'Only data nodes own shard WALs; coordinators are stateless routers; readers serve flushed S3+NVMe queries with automatic failover',
   },
   {
     surface: 'Document CRUD & Bulk',
-    endpoints: 'PUT/POST /{index}/_doc/{id}, GET/DELETE /{index}/_doc/{id}, POST /{index}/_update/{id}, POST /_bulk, POST /{index}/_bulk',
-    notes: 'Full NDJSON bulk streaming with CRC32C digest generation and sub-ms NVMe WAL ACK',
+    endpoints: 'PUT/POST /{index}/_doc/{id}, PUT /{index}/_create/{id} (?op_type=create), HEAD/GET/DELETE /{index}/_doc/{id}, POST /{index}/_update/{id}, POST /_bulk',
+    notes: '409 Conflict on duplicate create, strict JSON object validation, NDJSON bulk streaming, CRC32C digests & sub-ms NVMe WAL ACK',
   },
   {
     surface: 'Full-Text Query DSL',

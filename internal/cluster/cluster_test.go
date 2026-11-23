@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -756,4 +757,393 @@ func TestCoordinatorAndReaderNodeRolesAndPreferenceRouting(t *testing.T) {
 	if prefRes["hits"].(map[string]any)["total"].(map[string]any)["value"].(int) != 1 {
 		t.Fatalf("expected 1 hit for host=api-1 via reader preference, got %+v", prefRes)
 	}
+}
+
+func TestColdBootClusterMetadataAndAliasRecoveryFromS3(t *testing.T) {
+	ctx := context.Background()
+	s3Srv := s3store.NewMockServer("ak-cold", "sk-cold", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-coldboot",
+		AccessKey: "ak-cold",
+		SecretKey: "sk-cold",
+	})
+	if err != nil {
+		t.Fatalf("new s3 client: %v", err)
+	}
+
+	startCluster := func(specs []struct {
+		id    string
+		roles []string
+	}) ([]*cluster.Node, []*http.Server, []sharding.NodeInfo, func()) {
+		t.Helper()
+		listeners := make([]net.Listener, len(specs))
+		peers := make([]sharding.NodeInfo, len(specs))
+		for i, sp := range specs {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen %s: %v", sp.id, err)
+			}
+			listeners[i] = ln
+			peers[i] = sharding.NodeInfo{
+				ID:      sp.id,
+				Address: ln.Addr().String(),
+				Roles:   sp.roles,
+			}
+		}
+
+		nodes := make([]*cluster.Node, len(specs))
+		srvs := make([]*http.Server, len(specs))
+		for i, sp := range specs {
+			n, err := cluster.NewNode(cluster.NodeConfig{
+				NodeID:            sp.id,
+				Roles:             sp.roles,
+				AdvertiseAddress:  peers[i].Address,
+				NVMeDir:           t.TempDir(),
+				NVMeMaxBytes:      32 * 1024 * 1024,
+				FlushInterval:     30 * time.Second,
+				ReplicateInterval: 20 * time.Millisecond,
+				ScrubInterval:     30 * time.Second,
+				S3:                s3Client,
+				Peers:             peers,
+			})
+			if err != nil {
+				t.Fatalf("new node %s: %v", sp.id, err)
+			}
+			nodes[i] = n
+			srvs[i] = &http.Server{Handler: api.NewHandler(n)}
+			go func(srv *http.Server, ln net.Listener) {
+				_ = srv.Serve(ln)
+			}(srvs[i], listeners[i])
+		}
+
+		cleanup := func() {
+			for i := range nodes {
+				_ = srvs[i].Close()
+				_ = nodes[i].Close()
+			}
+		}
+		return nodes, srvs, peers, cleanup
+	}
+
+	// Phase 1: Boot cluster, create indices with mappings & aliases, ingest & flush to S3, then shut down completely.
+	phase1Specs := []struct {
+		id    string
+		roles []string
+	}{
+		{id: "data-1", roles: []string{sharding.RoleData}},
+		{id: "data-2", roles: []string{sharding.RoleData}},
+		{id: "coord-1", roles: []string{sharding.RoleCoordinator}},
+	}
+	_, _, peers1, shutdown1 := startCluster(phase1Specs)
+	coord1URL := "http://" + peers1[2].Address
+
+	create1Req, _ := http.NewRequest(http.MethodPut, coord1URL+"/logs-2026.11", strings.NewReader(`{
+		"settings": {"number_of_shards": 2, "number_of_replicas": 1},
+		"mappings": {"properties": {"service": {"type": "keyword"}}},
+		"aliases": {"logs-current": {}}
+	}`))
+	resp1, err := http.DefaultClient.Do(create1Req)
+	if err != nil || resp1.StatusCode != http.StatusOK {
+		t.Fatalf("create logs-2026.11 failed: err=%v resp=%v", err, resp1)
+	}
+	_ = resp1.Body.Close()
+
+	create2Req, _ := http.NewRequest(http.MethodPut, coord1URL+"/logs-2026.10", strings.NewReader(`{
+		"settings": {"number_of_shards": 2, "number_of_replicas": 1},
+		"aliases": {"logs-archive": {}}
+	}`))
+	resp2, err := http.DefaultClient.Do(create2Req)
+	if err != nil || resp2.StatusCode != http.StatusOK {
+		t.Fatalf("create logs-2026.10 failed: err=%v resp=%v", err, resp2)
+	}
+	_ = resp2.Body.Close()
+
+	bulkBody := strings.Join([]string{
+		`{"index":{"_index":"logs-2026.11","_id":"nov-1"}}`,
+		`{"service":"payments","msg":"cold boot recovery nov"}`,
+		`{"index":{"_index":"logs-2026.10","_id":"oct-1"}}`,
+		`{"service":"billing","msg":"cold boot recovery oct"}`,
+		"",
+	}, "\n")
+	bResp, err := http.Post(coord1URL+"/_bulk", "application/x-ndjson", strings.NewReader(bulkBody))
+	if err != nil || bResp.StatusCode != http.StatusOK {
+		t.Fatalf("bulk ingest failed: err=%v resp=%v", err, bResp)
+	}
+	_ = bResp.Body.Close()
+
+	fResp, err := http.Post(coord1URL+"/logs-*/_refresh?flush=true", "application/json", nil)
+	if err != nil || fResp.StatusCode != http.StatusOK {
+		t.Fatalf("wildcard flush failed: err=%v resp=%v", err, fResp)
+	}
+	_ = fResp.Body.Close()
+
+	// Total cluster shutdown (simulating all pods terminating and losing ephemeral NVMe).
+	shutdown1()
+
+	// Phase 2: Cold-boot fresh cluster (including a new reader node) with empty NVMe dirs against the same S3 bucket.
+	phase2Specs := []struct {
+		id    string
+		roles []string
+	}{
+		{id: "data-1", roles: []string{sharding.RoleData}},
+		{id: "data-2", roles: []string{sharding.RoleData}},
+		{id: "coord-1", roles: []string{sharding.RoleCoordinator}},
+		{id: "reader-1", roles: []string{sharding.RoleReader}},
+	}
+	nodes2, _, peers2, shutdown2 := startCluster(phase2Specs)
+	defer shutdown2()
+
+	coord2 := nodes2[2]
+	reader2 := nodes2[3]
+	coord2URL := "http://" + peers2[2].Address
+
+	// Verify mappings & aliases hydrated automatically on startup.
+	metaNov, ok := coord2.GetIndex("logs-2026.11")
+	if !ok {
+		t.Fatalf("expected logs-2026.11 recovered on cold-boot coordinator")
+	}
+	if len(metaNov.Aliases) != 1 || metaNov.Aliases[0] != "logs-current" {
+		t.Fatalf("expected alias logs-current recovered, got %+v", metaNov.Aliases)
+	}
+	props, _ := metaNov.Mappings["properties"].(map[string]any)
+	if props == nil || props["service"] == nil {
+		t.Fatalf("expected mappings.properties.service recovered, got %+v", metaNov.Mappings)
+	}
+
+	// Search by recovered alias via coordinator.
+	aliasResp, err := http.Post(coord2URL+"/logs-current/_search", "application/json", strings.NewReader(`{"query":{"match":{"msg":"recovery"}}}`))
+	if err != nil || aliasResp.StatusCode != http.StatusOK {
+		t.Fatalf("cold-boot alias search failed: err=%v resp=%v", err, aliasResp)
+	}
+	var aliasOut map[string]any
+	_ = json.NewDecoder(aliasResp.Body).Decode(&aliasOut)
+	_ = aliasResp.Body.Close()
+	if got := int(aliasOut["hits"].(map[string]any)["total"].(map[string]any)["value"].(float64)); got != 1 {
+		t.Fatalf("expected 1 hit via recovered alias logs-current, got %d (%+v)", got, aliasOut)
+	}
+
+	// Wildcard search routed to cold-booted stateless reader.
+	readerResp, err := http.Post(coord2URL+"/logs-*/_search?preference=reader", "application/json", strings.NewReader(`{"query":{"match":{"msg":"recovery"}}}`))
+	if err != nil || readerResp.StatusCode != http.StatusOK {
+		t.Fatalf("cold-boot wildcard reader search failed: err=%v resp=%v", err, readerResp)
+	}
+	var readerOut map[string]any
+	_ = json.NewDecoder(readerResp.Body).Decode(&readerOut)
+	_ = readerResp.Body.Close()
+	if got := int(readerOut["hits"].(map[string]any)["total"].(map[string]any)["value"].(float64)); got != 2 {
+		t.Fatalf("expected 2 hits across logs-* via cold-boot reader, got %d (%+v)", got, readerOut)
+	}
+	if reader2.NVMeCache().Stats().Entries == 0 {
+		t.Fatalf("expected cold-boot reader to populate NVMe cache from S3")
+	}
+
+	// Delete logs-2026.10 and confirm its S3 cluster metadata object is removed so a fresh node only sees logs-2026.11.
+	delReq, _ := http.NewRequest(http.MethodDelete, coord2URL+"/logs-2026.10", nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil || delResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete logs-2026.10 failed: err=%v resp=%v", err, delResp)
+	}
+	_ = delResp.Body.Close()
+
+	verifyNode, err := cluster.NewNode(cluster.NodeConfig{
+		NodeID:        "coord-verify",
+		Roles:         []string{sharding.RoleCoordinator},
+		NVMeDir:       t.TempDir(),
+		FlushInterval: 30 * time.Second,
+		S3:            s3Client,
+		Peers:         peers2,
+	})
+	if err != nil {
+		t.Fatalf("new verify node: %v", err)
+	}
+	defer verifyNode.Close()
+
+	if _, exists := verifyNode.GetIndex("logs-2026.10"); exists {
+		t.Fatalf("expected deleted index logs-2026.10 absent from S3 metadata")
+	}
+	if _, exists := verifyNode.GetIndex("logs-2026.11"); !exists {
+		t.Fatalf("expected surviving index logs-2026.11 present in S3 metadata")
+	}
+	_ = ctx
+}
+
+func TestS3FaultInjectionAndReaderOutageFailover(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("S3ManifestFaultPreservesWALAndRecovers", func(t *testing.T) {
+		s3Srv := s3store.NewMockServer("ak-flt", "sk-flt", "us-east-1")
+		defer s3Srv.Close()
+
+		s3Client, err := s3store.NewClient(s3store.Config{
+			Endpoint:  s3Srv.URL(),
+			Region:    "us-east-1",
+			Bucket:    "cindersearch-fault",
+			AccessKey: "ak-flt",
+			SecretKey: "sk-flt",
+		})
+		if err != nil {
+			t.Fatalf("new s3 client: %v", err)
+		}
+
+		n, err := cluster.NewNode(cluster.NodeConfig{
+			NodeID:        "data-fault",
+			NVMeDir:       t.TempDir(),
+			NVMeMaxBytes:  32 * 1024 * 1024,
+			FlushInterval: 30 * time.Second,
+			ScrubInterval: 30 * time.Second,
+			S3:            s3Client,
+		})
+		if err != nil {
+			t.Fatalf("new node: %v", err)
+		}
+		defer n.Close()
+
+		if err := n.CreateIndex(ctx, cluster.IndexMetadata{
+			Name:     "durable",
+			Settings: cluster.IndexSettings{NumberOfShards: 1, NumberOfReplicas: 0},
+		}, false); err != nil {
+			t.Fatalf("create index: %v", err)
+		}
+
+		if _, _, _, _, err := n.IndexDoc(ctx, "durable", "d1", []byte(`{"msg":"survive outage one"}`), ""); err != nil {
+			t.Fatalf("index d1: %v", err)
+		}
+		if _, _, _, _, err := n.IndexDoc(ctx, "durable", "d2", []byte(`{"msg":"survive outage two"}`), ""); err != nil {
+			t.Fatalf("index d2: %v", err)
+		}
+
+		// Inject S3 HTTP 500 on manifest.json PUT: FlushToS3 must fail without dropping memDocs or WAL!
+		s3Srv.SetFaultInjector(func(method, bucket, key string) (int, string) {
+			if method == http.MethodPut && strings.HasSuffix(key, "manifest.json") {
+				return http.StatusInternalServerError, "simulated s3 manifest outage"
+			}
+			return 0, ""
+		})
+
+		if err := n.RefreshIndex(ctx, "durable", true, false); err == nil {
+			t.Fatalf("expected flush to fail while S3 manifest PUT returns 500")
+		}
+
+		// Verify buffered docs remain intact & searchable after failed flush.
+		res, err := n.Search(ctx, []string{"durable"}, query.SearchRequest{
+			Query: map[string]any{"match": map[string]any{"msg": "survive"}},
+		}, cluster.RetrievalDropIn)
+		if err != nil {
+			t.Fatalf("search after failed flush: %v", err)
+		}
+		if got := res["hits"].(map[string]any)["total"].(map[string]any)["value"].(int); got != 2 {
+			t.Fatalf("expected both docs still searchable after manifest PUT 500, got %d", got)
+		}
+
+		// Clear fault injector and verify subsequent flush succeeds and persists to S3.
+		s3Srv.SetFaultInjector(nil)
+		if err := n.RefreshIndex(ctx, "durable", true, false); err != nil {
+			t.Fatalf("flush after S3 recovery failed: %v", err)
+		}
+
+		presignedRes, err := n.Search(ctx, []string{"durable"}, query.SearchRequest{
+			Query: map[string]any{"term": map[string]any{"_id": "d1"}},
+		}, cluster.RetrievalPresigned)
+		if err != nil {
+			t.Fatalf("presigned search after S3 recovery: %v", err)
+		}
+		hits := presignedRes["hits"].(map[string]any)["hits"].([]map[string]any)
+		if len(hits) != 1 || hits[0]["_s3_pointer"] == nil {
+			t.Fatalf("expected _s3_pointer after recovered flush, got %+v", hits)
+		}
+	})
+
+	t.Run("ReaderOutageFailoverToDataNodes", func(t *testing.T) {
+		s3Srv := s3store.NewMockServer("ak-rf", "sk-rf", "us-east-1")
+		defer s3Srv.Close()
+
+		s3Client, err := s3store.NewClient(s3store.Config{
+			Endpoint:  s3Srv.URL(),
+			Region:    "us-east-1",
+			Bucket:    "cindersearch-reader-failover",
+			AccessKey: "ak-rf",
+			SecretKey: "sk-rf",
+		})
+		if err != nil {
+			t.Fatalf("new s3 client: %v", err)
+		}
+
+		specs := []struct {
+			id    string
+			roles []string
+		}{
+			{id: "data-1", roles: []string{sharding.RoleData}},
+			{id: "coord-1", roles: []string{sharding.RoleCoordinator}},
+			{id: "reader-1", roles: []string{sharding.RoleReader}},
+		}
+		nodes := make([]*cluster.Node, len(specs))
+		srvs := make([]*httptest.Server, len(specs))
+		peers := make([]sharding.NodeInfo, len(specs))
+		for i, sp := range specs {
+			n, err := cluster.NewNode(cluster.NodeConfig{
+				NodeID:        sp.id,
+				Roles:         sp.roles,
+				NVMeDir:       t.TempDir(),
+				NVMeMaxBytes:  32 * 1024 * 1024,
+				FlushInterval: 30 * time.Second,
+				ScrubInterval: 30 * time.Second,
+				S3:            s3Client,
+			})
+			if err != nil {
+				t.Fatalf("new node %s: %v", sp.id, err)
+			}
+			nodes[i] = n
+			srvs[i] = httptest.NewServer(api.NewHandler(n))
+			peers[i] = sharding.NodeInfo{
+				ID:      sp.id,
+				Address: strings.TrimPrefix(srvs[i].URL, "http://"),
+				Roles:   sp.roles,
+			}
+		}
+		for _, n := range nodes {
+			n.UpdatePeers(peers)
+		}
+		defer func() {
+			srvs[0].Close()
+			srvs[1].Close()
+			_ = nodes[0].Close()
+			_ = nodes[1].Close()
+		}()
+
+		coord := nodes[1]
+		if err := coord.CreateIndex(ctx, cluster.IndexMetadata{
+			Name:     "metrics",
+			Settings: cluster.IndexSettings{NumberOfShards: 2, NumberOfReplicas: 0},
+		}, true); err != nil {
+			t.Fatalf("create metrics: %v", err)
+		}
+		if _, _, _, _, err := coord.IndexDoc(ctx, "metrics", "m1", []byte(`{"host":"h1","msg":"failover test"}`), ""); err != nil {
+			t.Fatalf("index m1: %v", err)
+		}
+		if _, _, _, _, err := coord.IndexDoc(ctx, "metrics", "m2", []byte(`{"host":"h2","msg":"failover test"}`), ""); err != nil {
+			t.Fatalf("index m2: %v", err)
+		}
+		if err := coord.RefreshIndex(ctx, "metrics", true, true); err != nil {
+			t.Fatalf("flush metrics: %v", err)
+		}
+
+		// Shut down reader-1 completely.
+		srvs[2].Close()
+		_ = nodes[2].Close()
+
+		// preference=reader must transparently fall back to data-1 and return both hits!
+		res, err := coord.SearchWithPreference(ctx, []string{"metrics"}, query.SearchRequest{
+			Query: map[string]any{"match": map[string]any{"msg": "failover"}},
+		}, cluster.RetrievalDropIn, true)
+		if err != nil {
+			t.Fatalf("search with reader outage failed: %v", err)
+		}
+		if got := res["hits"].(map[string]any)["total"].(map[string]any)["value"].(int); got != 2 {
+			t.Fatalf("expected 2 hits via data-node fallback during reader outage, got %d (%+v)", got, res)
+		}
+	})
 }

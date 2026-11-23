@@ -532,3 +532,244 @@ func BenchmarkESSearchPresignedZeroHopHTTP(b *testing.B) {
 	}
 	b.StopTimer()
 }
+
+func TestESv8CompatHeadersHeadCreateConflictMappingCountAliasesAndWildcards(t *testing.T) {
+	_, srvs, _, _ := newTestCluster(t, 2, 16*1024*1024)
+
+	// 1. Official ES v8 client handshake headers & content-type negotiation
+	v8Req, _ := http.NewRequest(http.MethodGet, srvs[0].URL+"/", nil)
+	v8Req.Header.Set("Accept", "application/vnd.elasticsearch+json; compatible-with=8")
+	v8Resp, err := http.DefaultClient.Do(v8Req)
+	if err != nil {
+		t.Fatalf("GET / with ES v8 Accept header: %v", err)
+	}
+	_ = v8Resp.Body.Close()
+	if v8Resp.Header.Get("X-Elastic-Product") != "Elasticsearch" {
+		t.Fatalf("expected X-Elastic-Product: Elasticsearch, got %q", v8Resp.Header.Get("X-Elastic-Product"))
+	}
+	if !strings.Contains(v8Resp.Header.Get("Content-Type"), "application/vnd.elasticsearch+json; compatible-with=8") {
+		t.Fatalf("expected ES v8 compatible Content-Type, got %q", v8Resp.Header.Get("Content-Type"))
+	}
+
+	// 2. HEAD /{index} before & after creation (with inline alias + mapping)
+	headMissing, err := http.Head(srvs[0].URL + "/logs-app")
+	if err != nil || headMissing.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected HEAD /logs-app 404 before create, got err=%v resp=%v", err, headMissing)
+	}
+	_ = headMissing.Body.Close()
+
+	code, _ := doJSONReq(t, http.MethodPut, srvs[0].URL+"/logs-app", `{
+		"settings": {"number_of_shards": 2, "number_of_replicas": 0},
+		"mappings": {"properties": {"env": {"type": "keyword"}}},
+		"aliases": {"logs-live": {}}
+	}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("create logs-app failed: %d", code)
+	}
+
+	for _, target := range []string{"/logs-app", "/logs-live"} {
+		hResp, err := http.Head(srvs[1].URL + target)
+		if err != nil || hResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected HEAD %s 200 on peer node, got err=%v resp=%v", target, err, hResp)
+		}
+		if hResp.Header.Get("X-Elastic-Product") != "Elasticsearch" {
+			t.Fatalf("expected X-Elastic-Product header on HEAD %s", target)
+		}
+		_ = hResp.Body.Close()
+	}
+
+	// 3. GET/PUT /{index}/_mapping merge & peer sync
+	code, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/logs-app/_mapping", `{"properties":{"service":{"type":"keyword"}}}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("PUT _mapping failed: %d", code)
+	}
+	code, mapOut := doJSONReq(t, http.MethodGet, srvs[1].URL+"/logs-app/_mapping", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET _mapping failed: %d body=%+v", code, mapOut)
+	}
+	props := mapOut["logs-app"].(map[string]any)["mappings"].(map[string]any)["properties"].(map[string]any)
+	if props["env"] == nil || props["service"] == nil {
+		t.Fatalf("expected merged mapping properties env and service on peer, got %+v", props)
+	}
+
+	// 4. PUT /{index}/_create/{id}, ?op_type=create 409 Conflict (local + cross-node), and HEAD /{index}/_doc/{id}
+	code, created := doJSONReq(t, http.MethodPut, srvs[0].URL+"/logs-app/_create/doc-1", `{"env":"prod","service":"api","msg":"first"}`, nil)
+	if code != http.StatusCreated || created["result"] != "created" {
+		t.Fatalf("expected 201 on first _create, got %d body=%+v", code, created)
+	}
+	code, dup1 := doJSONReq(t, http.MethodPut, srvs[0].URL+"/logs-app/_create/doc-1", `{"env":"prod","service":"api","msg":"dup"}`, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on duplicate _create, got %d body=%+v", code, dup1)
+	}
+	code, dup2 := doJSONReq(t, http.MethodPut, srvs[1].URL+"/logs-app/_doc/doc-1?op_type=create", `{"env":"prod","service":"api","msg":"dup2"}`, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on peer ?op_type=create, got %d body=%+v", code, dup2)
+	}
+
+	for i, srv := range srvs {
+		hDoc, err := http.Head(srv.URL + "/logs-app/_doc/doc-1")
+		if err != nil || hDoc.StatusCode != http.StatusOK {
+			t.Fatalf("node %d HEAD existing doc failed: err=%v resp=%v", i, err, hDoc)
+		}
+		_ = hDoc.Body.Close()
+
+		hMiss, err := http.Head(srv.URL + "/logs-app/_doc/does-not-exist")
+		if err != nil || hMiss.StatusCode != http.StatusNotFound {
+			t.Fatalf("node %d HEAD missing doc expected 404: err=%v resp=%v", i, err, hMiss)
+		}
+		_ = hMiss.Body.Close()
+	}
+
+	// 5. _bulk create 409 Conflict + malformed JSON item 400 + valid create 201
+	bulkPayload := strings.Join([]string{
+		`{"create":{"_index":"logs-app","_id":"doc-1"}}`,
+		`{"env":"prod","msg":"conflict in bulk"}`,
+		`{"create":{"_index":"logs-app","_id":"doc-2"}}`,
+		`{"env":"prod","service":"web","msg":"second"}`,
+		`{"index":{"_index":"logs-app","_id":"bad-1"}}`,
+		`not-valid-json`,
+		"",
+	}, "\n")
+	code, bulkRes := doJSONReq(t, http.MethodPost, srvs[0].URL+"/_bulk", bulkPayload, nil)
+	if code != http.StatusOK || bulkRes["errors"] != true {
+		t.Fatalf("expected 200 with errors=true for mixed _bulk, got %d body=%+v", code, bulkRes)
+	}
+	items := bulkRes["items"].([]any)
+	if len(items) != 3 {
+		t.Fatalf("expected 3 bulk items, got %d: %+v", len(items), items)
+	}
+	if int(items[0].(map[string]any)["create"].(map[string]any)["status"].(float64)) != http.StatusConflict {
+		t.Fatalf("expected bulk item 0 status 409, got %+v", items[0])
+	}
+	if int(items[1].(map[string]any)["create"].(map[string]any)["status"].(float64)) != http.StatusCreated {
+		t.Fatalf("expected bulk item 1 status 201, got %+v", items[1])
+	}
+	if int(items[2].(map[string]any)["index"].(map[string]any)["status"].(float64)) != http.StatusBadRequest {
+		t.Fatalf("expected bulk item 2 status 400, got %+v", items[2])
+	}
+
+	// 6. Additional indices + atomic POST /_aliases + /{index}/_alias/{name} lifecycle
+	_, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/logs-debug", `{"settings":{"number_of_shards":1,"number_of_replicas":0}}`, nil)
+	_, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/logs-debug/_doc/dbg-1", `{"env":"dev","msg":"debug trace"}`, nil)
+	_, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/metrics-1", `{"settings":{"number_of_shards":1,"number_of_replicas":0}}`, nil)
+	_, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/metrics-1/_doc/m-1", `{"host":"n1","cpu":0.4}`, nil)
+
+	code, _ = doJSONReq(t, http.MethodPost, srvs[0].URL+"/_aliases", `{
+		"actions": [
+			{"add": {"index": "logs-*", "alias": "all-logs"}},
+			{"remove": {"index": "logs-debug", "alias": "all-logs"}}
+		]
+	}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("POST /_aliases failed: %d", code)
+	}
+
+	code, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/metrics-1/_alias/m-read", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("PUT /metrics-1/_alias/m-read failed: %d", code)
+	}
+	hAlias, err := http.Head(srvs[1].URL + "/_alias/m-read")
+	if err != nil || hAlias.StatusCode != http.StatusOK {
+		t.Fatalf("expected HEAD /_alias/m-read 200 on peer, got err=%v resp=%v", err, hAlias)
+	}
+	_ = hAlias.Body.Close()
+
+	code, aliasMap := doJSONReq(t, http.MethodGet, srvs[1].URL+"/_alias/all-logs", "", nil)
+	if code != http.StatusOK || aliasMap["logs-app"] == nil || aliasMap["logs-debug"] != nil {
+		t.Fatalf("expected all-logs to point only to logs-app after atomic add/remove, got %d body=%+v", code, aliasMap)
+	}
+
+	code, _ = doJSONReq(t, http.MethodDelete, srvs[0].URL+"/metrics-1/_alias/m-read", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("DELETE /metrics-1/_alias/m-read failed: %d", code)
+	}
+	hAliasDel, err := http.Head(srvs[1].URL + "/_alias/m-read")
+	if err != nil || hAliasDel.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected HEAD /_alias/m-read 404 after delete, got err=%v resp=%v", err, hAliasDel)
+	}
+	_ = hAliasDel.Body.Close()
+
+	// 7. Wildcards, exclusions, _all, alias expansion, and _count
+	assertCount := func(path string, want int) {
+		t.Helper()
+		c, out := doJSONReq(t, http.MethodGet, srvs[0].URL+path, "", nil)
+		if c != http.StatusOK {
+			t.Fatalf("GET %s failed: code=%d body=%+v", path, c, out)
+		}
+		if got := int(out["count"].(float64)); got != want {
+			t.Fatalf("GET %s count mismatch: got %d want %d (body=%+v)", path, got, want, out)
+		}
+	}
+
+	assertCount("/logs-*/_count", 3)
+	assertCount("/logs-*,-logs-debug/_count", 2)
+	assertCount("/_all/_count", 4)
+	assertCount("/_count", 4)
+	assertCount("/logs-live/_count", 2)
+	assertCount("/no-such-*/_count", 0)
+
+	code, aliasSearch := doJSONReq(t, http.MethodPost, srvs[1].URL+"/logs-live/_search", `{"query":{"term":{"env":"prod"}}}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("alias search failed: %d body=%+v", code, aliasSearch)
+	}
+	if got := int(aliasSearch["hits"].(map[string]any)["total"].(map[string]any)["value"].(float64)); got != 2 {
+		t.Fatalf("expected 2 hits from alias logs-live, got %d", got)
+	}
+
+	code, zeroWild := doJSONReq(t, http.MethodPost, srvs[0].URL+"/nonexistent-*/_search", `{"query":{"match_all":{}}}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("unmatched wildcard search expected 200, got %d body=%+v", code, zeroWild)
+	}
+	if got := int(zeroWild["hits"].(map[string]any)["total"].(map[string]any)["value"].(float64)); got != 0 {
+		t.Fatalf("expected 0 hits for unmatched wildcard, got %d", got)
+	}
+}
+
+func FuzzESBulkNDJSON(f *testing.F) {
+	s3Srv := s3store.NewMockServer("ak-fz", "sk-fz", "us-east-1")
+	defer s3Srv.Close()
+
+	s3Client, err := s3store.NewClient(s3store.Config{
+		Endpoint:  s3Srv.URL(),
+		Region:    "us-east-1",
+		Bucket:    "cindersearch-fuzz",
+		AccessKey: "ak-fz",
+		SecretKey: "sk-fz",
+	})
+	if err != nil {
+		f.Fatalf("new s3 client: %v", err)
+	}
+
+	node, err := cluster.NewNode(cluster.NodeConfig{
+		NodeID:        "node-fuzz",
+		NVMeDir:       f.TempDir(),
+		NVMeMaxBytes:  8 * 1024 * 1024,
+		FlushInterval: 60 * time.Second,
+		ScrubInterval: 60 * time.Second,
+		S3:            s3Client,
+	})
+	if err != nil {
+		f.Fatalf("new node: %v", err)
+	}
+	defer node.Close()
+
+	handler := api.NewHandler(node)
+
+	f.Add([]byte("{\"index\":{\"_id\":\"1\"}}\n{\"msg\":\"ok\"}\n"))
+	f.Add([]byte("{\"create\":{\"_index\":\"fuzz\",\"_id\":\"1\"}}\n{\"a\":1}\n"))
+	f.Add([]byte("{\"delete\":{\"_index\":\"fuzz\",\"_id\":\"1\"}}\n"))
+	f.Add([]byte("{\"update\":{\"_index\":\"fuzz\",\"_id\":\"1\"}}\n{\"doc\":{\"x\":2}}\n"))
+	f.Add([]byte("{\"index\":{}}\n"))
+	f.Add([]byte("not json\n{}"))
+	f.Add([]byte("{\"index\":{\"_id\":\"1\"}}\nnull\n"))
+
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		req := httptest.NewRequest(http.MethodPost, "/fuzzidx/_bulk?pretty=false", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/x-ndjson")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code == 0 {
+			t.Fatalf("expected non-zero HTTP status code")
+		}
+	})
+}

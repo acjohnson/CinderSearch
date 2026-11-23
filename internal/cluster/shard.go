@@ -339,12 +339,6 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 		return nil, err
 	}
 
-	// Warm NVMe read cache immediately so queries stay sub-millisecond after flush.
-	if s.nvmeCache != nil {
-		_ = s.nvmeCache.Put(idxKey, idxBytes, idxCRC)
-		_ = s.nvmeCache.Put(docsKey, docsBytes, docsCRC)
-	}
-
 	ref := SegmentRef{
 		ID:         segID,
 		IdxKey:     idxKey,
@@ -357,6 +351,37 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 		CreatedAt:  time.Now().UTC().Unix(),
 	}
 
+	// Build and persist authoritative S3 manifest BEFORE mutating local memDocs or compacting WAL.
+	// If S3 fails here, memDocs and WAL remain intact so the next flush retries safely.
+	s.mu.RLock()
+	nextFlushedSeq := s.flushedSeq
+	if maxSeq > nextFlushedSeq {
+		nextFlushedSeq = maxSeq
+	}
+	nextSegments := make([]SegmentRef, len(s.segments)+1)
+	copy(nextSegments, s.segments)
+	nextSegments[len(s.segments)] = ref
+	s.mu.RUnlock()
+
+	man := ShardManifest{
+		IndexName:  s.indexName,
+		ShardID:    s.shardID,
+		FlushedSeq: nextFlushedSeq,
+		Segments:   nextSegments,
+	}
+	manBytes, err := json.Marshal(man)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.s3.PutObject(ctx, manifestKey(s.indexName, s.shardID), manBytes); err != nil {
+		return nil, err
+	}
+
+	// Warm NVMe read cache and in-memory decoded segment cache after S3 commit succeeds.
+	if s.nvmeCache != nil {
+		_ = s.nvmeCache.Put(idxKey, idxBytes, idxCRC)
+		_ = s.nvmeCache.Put(docsKey, docsBytes, docsCRC)
+	}
 	seg.DocsCRC32C = docsCRC
 	s.segCacheMu.Lock()
 	s.decodedSegs[idxKey] = seg
@@ -366,7 +391,7 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 
 	s.mu.Lock()
 	s.segCounter = nextCounter
-	s.segments = append(s.segments, ref)
+	s.segments = nextSegments
 	for docID, rec := range s.memDocs {
 		if fSeq, ok := flushedSeqs[docID]; ok && rec.Seq <= fSeq {
 			delete(s.memDocs, docID)
@@ -387,21 +412,8 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	} else {
 		s.memSeg = nil
 	}
-	man := ShardManifest{
-		IndexName:  s.indexName,
-		ShardID:    s.shardID,
-		FlushedSeq: s.flushedSeq,
-		Segments:   append([]SegmentRef(nil), s.segments...),
-	}
 	s.mu.Unlock()
 
-	manBytes, err := json.Marshal(man)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := s.s3.PutObject(ctx, manifestKey(s.indexName, s.shardID), manBytes); err != nil {
-		return nil, err
-	}
 	if compactSeq > 0 {
 		if err := s.wal.CompactUpTo(compactSeq); err != nil {
 			return nil, err
@@ -636,6 +648,34 @@ func (s *Shard) GetDocByID(ctx context.Context, docID string) (raw []byte, found
 		}
 	}
 	return nil, false, 0, segment.DocMeta{}, nil, nil
+}
+
+// DocExists reports whether a live (non-deleted) document with docID exists in this shard
+// without reading its _source bytes from NVMe or S3.
+func (s *Shard) DocExists(ctx context.Context, docID string) (bool, error) {
+	s.mu.RLock()
+	if rec, ok := s.memDocs[docID]; ok {
+		s.mu.RUnlock()
+		return rec.Op != wal.OpDelete, nil
+	}
+	s.mu.RUnlock()
+
+	segs, latestSeq, err := s.ActiveSegments(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, seg := range segs {
+		if delSeq, isDel := seg.Tombstones[docID]; isDel && delSeq >= latestSeq[docID] {
+			return false, nil
+		}
+		if idx, ok := seg.DocIDToIdx[docID]; ok {
+			if seg.Docs[idx].Seq < latestSeq[docID] {
+				continue
+			}
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Stats returns shard-level diagnostics.

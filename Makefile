@@ -8,7 +8,7 @@ GO          ?= go
 GOFLAGS     ?=
 RACE_FLAG   := -race
 
-.PHONY: all build test test-v race bench bench-live profile-cpu profile-mem demo run docker-build helm-lint helm-template fmt fmt-check vet lint tidy clean help
+.PHONY: all build test test-v race fuzz test-s3-integration bench bench-live profile-cpu profile-mem demo run docker-build helm-lint helm-template fmt fmt-check vet lint tidy clean help
 
 all: vet test build
 
@@ -28,6 +28,16 @@ test-v:
 
 ## race: Alias for race-enabled test suite
 race: test
+
+## fuzz: Run short Go fuzz passes across WAL, Query DSL, and _bulk NDJSON parsers
+fuzz:
+	$(GO) test -fuzz=FuzzWALReplayCorruptBytes -fuzztime=5s ./internal/wal
+	$(GO) test -fuzz=FuzzQueryStringAndWildcard -fuzztime=5s ./internal/query
+	$(GO) test -fuzz=FuzzESBulkNDJSON -fuzztime=5s ./internal/api
+
+## test-s3-integration: Run build-tagged integration test against a real AWS S3 or MinIO endpoint
+test-s3-integration:
+	$(GO) test -tags=integration -v -count=1 ./internal/s3store
 
 ## bench: Run Go microbenchmarks for CRC32C, WAL, NVMe, segment, query, and HTTP
 bench:

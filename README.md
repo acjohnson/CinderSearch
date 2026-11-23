@@ -17,6 +17,8 @@
   - `coordinator`: Stateless HTTP router, Query DSL scatter-gather coordinator, and cross-shard aggregation/sort merger with zero local shards or WALs.
   - `reader`: Stateless S3 + NVMe read-cache search node (no WALs, no shard ownership) for horizontally scaling search QPS; supports `?preference=reader` / `X-Cinder-Preference: reader` routing while still forwarding `_doc` reads to `data` primaries for NRT consistency.
   - Unsupported legacy ES roles (`master`, `ml`, `ingest`, `data_hot`/`warm`/`cold`/`frozen`, `transform`, `remote_cluster_client`) are explicitly rejected—leaderless ring metadata + S3 tiering replace master-only and hot/warm/cold splits.
+- **S3-Persisted Cluster Metadata & Cold-Boot Recovery**: Index settings, mappings, and aliases are persisted to `_cluster/indices/<name>.json` on S3 and automatically hydrated on node startup, enabling full cluster recovery even after total pod/NVMe loss.
+- **Official ES v8 Client Handshake, Aliases & Wildcards**: Emits `X-Elastic-Product: Elasticsearch` and negotiates `application/vnd.elasticsearch+json; compatible-with=8`; supports `HEAD /{index}`, `HEAD /{index}/_doc/{id}`, `PUT /{index}/_create/{id}` / `?op_type=create` (`409 Conflict`), `GET/PUT /{index}/_mapping`, `GET/POST /_count`, atomic `POST /_aliases`, `/{index}/_alias/{name}`, and wildcard/exclusion index resolution (`logs-*,-logs-debug*`, `_all`).
 - **Bit-Rot Protection**: Every WAL frame, replica stream, NVMe cache entry, S3 segment footer, and `_s3_pointer` carries a Castagnoli `CRC32C` digest. Corrupted NVMe cache entries are quarantined and automatically healed from S3.
 
 ## Quickstart
@@ -27,6 +29,13 @@ make build
 
 # Run full unit & integration test suite (with -race)
 make test
+
+# Run Go fuzz tests across WAL, Query DSL, and _bulk NDJSON parsers
+make fuzz
+
+# Run build-tagged integration test against real AWS S3 or MinIO
+CINDER_TEST_S3_ENDPOINT=http://127.0.0.1:9000 CINDER_TEST_S3_BUCKET=cindersearch \
+  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin make test-s3-integration
 
 # Run the automated 3-node S3 + NVMe + Bit-Rot healing demo
 make demo

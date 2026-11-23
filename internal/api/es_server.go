@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,9 @@ func NewHandler(node *cluster.Node) http.Handler {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Official Elasticsearch v8+ clients require X-Elastic-Product on every response.
+	w.Header().Set("X-Elastic-Product", "Elasticsearch")
+
 	path := strings.TrimRight(r.URL.Path, "/")
 	if path == "" {
 		path = "/"
@@ -81,19 +85,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/_search" && (r.Method == http.MethodPost || r.Method == http.MethodGet):
 		s.handleSearch(w, r, nil)
 		return
+	case path == "/_count" && (r.Method == http.MethodPost || r.Method == http.MethodGet):
+		s.handleCount(w, r, nil)
+		return
+	case path == "/_aliases" && r.Method == http.MethodPost:
+		s.handleUpdateAliases(w, r)
+		return
+	case (path == "/_aliases" || path == "/_alias") && r.Method == http.MethodGet:
+		s.handleGetAliases(w, r, nil, "")
+		return
+	case strings.HasPrefix(path, "/_alias/"):
+		aliasName := strings.TrimPrefix(path, "/_alias/")
+		if r.Method == http.MethodHead {
+			res := s.node.GetAliases(nil, aliasName)
+			if len(res) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet {
+			s.handleGetAliases(w, r, nil, aliasName)
+			return
+		}
 	}
 
-	// Index-scoped routes: /{index}, /{index}/_doc/{id}, /{index}/_bulk, /{index}/_search, /{index}/_refresh
+	// Index-scoped routes: /{index}, /{index}/_doc/{id}, /{index}/_create/{id}, /{index}/_bulk,
+	// /{index}/_search, /{index}/_count, /{index}/_refresh, /{index}/_mapping, /{index}/_alias/{name}
 	trimmed := strings.TrimPrefix(path, "/")
 	parts := strings.Split(trimmed, "/")
 	indexName := parts[0]
-	if indexName == "" || strings.HasPrefix(indexName, "_") {
+	if indexName == "" || (strings.HasPrefix(indexName, "_") && indexName != "_all") {
 		s.writeESError(w, r, http.StatusNotFound, "no_such_route", "unknown endpoint "+path)
 		return
 	}
 
 	if len(parts) == 1 {
 		switch r.Method {
+		case http.MethodHead:
+			if s.node.HasIndexOrAlias(indexName) {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
 		case http.MethodPut:
 			s.handleCreateIndex(w, r, indexName)
 		case http.MethodGet:
@@ -110,22 +145,46 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "_refresh":
 		flush := r.URL.Query().Get("flush") == "true"
-		if err := s.node.RefreshIndex(r.Context(), indexName, flush, true); err != nil {
-			s.writeESError(w, r, http.StatusInternalServerError, "refresh_error", err.Error())
+		resolved, err := s.node.ResolveIndices(strings.Split(indexName, ","))
+		if err != nil {
+			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
 			return
 		}
-		s.writeJSON(w, r, http.StatusOK, map[string]any{"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0}})
+		for _, idx := range resolved {
+			if err := s.node.RefreshIndex(r.Context(), idx, flush, true); err != nil {
+				s.writeESError(w, r, http.StatusInternalServerError, "refresh_error", err.Error())
+				return
+			}
+		}
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"_shards": map[string]any{"total": len(resolved), "successful": len(resolved), "failed": 0}})
 	case "_bulk":
 		s.handleBulk(w, r, indexName)
 	case "_search":
 		indices := strings.Split(indexName, ",")
 		s.handleSearch(w, r, indices)
+	case "_count":
+		indices := strings.Split(indexName, ",")
+		s.handleCount(w, r, indices)
+	case "_mapping", "_mappings":
+		s.handleMapping(w, r, indexName)
+	case "_alias", "_aliases":
+		aliasName := ""
+		if len(parts) >= 3 {
+			aliasName = parts[2]
+		}
+		s.handleIndexAlias(w, r, indexName, aliasName)
 	case "_doc":
 		docID := ""
 		if len(parts) >= 3 {
 			docID = parts[2]
 		}
-		s.handleDoc(w, r, indexName, docID)
+		s.handleDoc(w, r, indexName, docID, r.URL.Query().Get("op_type"))
+	case "_create":
+		if len(parts) < 3 || parts[2] == "" {
+			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required for _create")
+			return
+		}
+		s.handleDoc(w, r, indexName, parts[2], "create")
 	case "_update":
 		if len(parts) < 3 {
 			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required")
@@ -307,14 +366,20 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, index
 	var body struct {
 		Settings cluster.IndexSettings `json:"settings"`
 		Mappings map[string]any        `json:"mappings"`
+		Aliases  map[string]any        `json:"aliases"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	var aliasNames []string
+	for name := range body.Aliases {
+		aliasNames = append(aliasNames, name)
 	}
 	meta := cluster.IndexMetadata{
 		Name:     indexName,
 		Settings: body.Settings,
 		Mappings: body.Mappings,
+		Aliases:  aliasNames,
 	}
 	if err := s.node.CreateIndex(r.Context(), meta, true); err != nil {
 		s.writeESError(w, r, http.StatusBadRequest, "index_creation_exception", err.Error())
@@ -328,17 +393,28 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, index
 }
 
 func (s *Server) handleGetIndex(w http.ResponseWriter, r *http.Request, indexName string) {
-	meta, ok := s.node.GetIndex(indexName)
-	if !ok {
+	resolved, err := s.node.ResolveIndices(strings.Split(indexName, ","))
+	if err != nil {
 		s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexName+"]")
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, map[string]any{
-		indexName: map[string]any{
+	out := make(map[string]any, len(resolved))
+	for _, name := range resolved {
+		meta, ok := s.node.GetIndex(name)
+		if !ok {
+			continue
+		}
+		aliasesObj := make(map[string]any, len(meta.Aliases))
+		for _, a := range meta.Aliases {
+			aliasesObj[a] = map[string]any{}
+		}
+		out[name] = map[string]any{
+			"aliases":  aliasesObj,
 			"mappings": meta.Mappings,
 			"settings": map[string]any{"index": meta.Settings},
-		},
-	})
+		}
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
 }
 
 func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request, indexName string) {
@@ -349,9 +425,160 @@ func (s *Server) handleDeleteIndex(w http.ResponseWriter, r *http.Request, index
 	s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
-func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, docID string) {
+func (s *Server) handleMapping(w http.ResponseWriter, r *http.Request, indexPattern string) {
+	switch r.Method {
+	case http.MethodGet:
+		resolved, err := s.node.ResolveIndices(strings.Split(indexPattern, ","))
+		if err != nil {
+			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
+			return
+		}
+		out := make(map[string]any, len(resolved))
+		for _, name := range resolved {
+			if meta, ok := s.node.GetIndex(name); ok {
+				mappings := meta.Mappings
+				if mappings == nil {
+					mappings = map[string]any{}
+				}
+				out[name] = map[string]any{"mappings": mappings}
+			}
+		}
+		s.writeJSON(w, r, http.StatusOK, out)
+	case http.MethodPut, http.MethodPost:
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			s.writeESError(w, r, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+			return
+		}
+		resolved, err := s.node.ResolveIndices(strings.Split(indexPattern, ","))
+		if err != nil {
+			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
+			return
+		}
+		for _, name := range resolved {
+			if err := s.node.PutMapping(r.Context(), name, body, true); err != nil {
+				s.writeESError(w, r, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+				return
+			}
+		}
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+	default:
+		s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
+	}
+}
+
+func (s *Server) handleUpdateAliases(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Actions []map[string]struct {
+			Index   string   `json:"index"`
+			Indices []string `json:"indices"`
+			Alias   string   `json:"alias"`
+		} `json:"actions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeESError(w, r, http.StatusBadRequest, "parse_exception", err.Error())
+		return
+	}
+	var actions []cluster.AliasAction
+	for _, entry := range body.Actions {
+		for op, spec := range entry {
+			actions = append(actions, cluster.AliasAction{
+				Action:  op,
+				Index:   spec.Index,
+				Indices: spec.Indices,
+				Alias:   spec.Alias,
+			})
+		}
+	}
+	if err := s.node.UpdateAliases(r.Context(), actions, true); err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "index_not_found_exception") {
+			status = http.StatusNotFound
+		}
+		s.writeESError(w, r, status, "aliases_action_exception", err.Error())
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+}
+
+func (s *Server) handleGetAliases(w http.ResponseWriter, r *http.Request, indexPatterns []string, aliasFilter string) {
+	res := s.node.GetAliases(indexPatterns, aliasFilter)
+	if aliasFilter != "" && len(res) == 0 {
+		s.writeESError(w, r, http.StatusNotFound, "alias_not_found_exception", "alias ["+aliasFilter+"] missing")
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, res)
+}
+
+func (s *Server) handleIndexAlias(w http.ResponseWriter, r *http.Request, indexPattern, aliasName string) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGetAliases(w, r, strings.Split(indexPattern, ","), aliasName)
+	case http.MethodHead:
+		res := s.node.GetAliases(strings.Split(indexPattern, ","), aliasName)
+		if len(res) == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	case http.MethodPut, http.MethodPost:
+		if aliasName == "" {
+			s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "alias name is required")
+			return
+		}
+		err := s.node.UpdateAliases(r.Context(), []cluster.AliasAction{{
+			Action: "add",
+			Index:  indexPattern,
+			Alias:  aliasName,
+		}}, true)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "index_not_found_exception") {
+				status = http.StatusNotFound
+			}
+			s.writeESError(w, r, status, "aliases_action_exception", err.Error())
+			return
+		}
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+	case http.MethodDelete:
+		if aliasName == "" {
+			s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "alias name is required")
+			return
+		}
+		err := s.node.UpdateAliases(r.Context(), []cluster.AliasAction{{
+			Action: "remove",
+			Index:  indexPattern,
+			Alias:  aliasName,
+		}}, true)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "index_not_found_exception") {
+				status = http.StatusNotFound
+			}
+			s.writeESError(w, r, status, "aliases_action_exception", err.Error())
+			return
+		}
+		s.writeJSON(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+	default:
+		s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
+	}
+}
+
+func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, docID, opType string) {
 	routing := r.URL.Query().Get("routing")
 	switch r.Method {
+	case http.MethodHead:
+		if docID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		exists, err := s.node.DocExists(r.Context(), indexName, docID, routing)
+		if err != nil || !exists {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+
 	case http.MethodPut, http.MethodPost:
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -359,18 +586,26 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			return
 		}
 		var check map[string]any
-		if err := json.Unmarshal(raw, &check); err != nil {
-			s.writeESError(w, r, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
+		if err := json.Unmarshal(raw, &check); err != nil || check == nil {
+			reason := "document body must be a JSON object"
+			if err != nil {
+				reason = err.Error()
+			}
+			s.writeESError(w, r, http.StatusBadRequest, "mapper_parsing_exception", reason)
 			return
 		}
-		assignedID, shardID, crc, seq, err := s.node.IndexDoc(r.Context(), indexName, docID, raw, routing)
+		assignedID, shardID, crc, seq, err := s.node.IndexDocWithOpType(r.Context(), indexName, docID, raw, routing, opType)
 		if err != nil {
+			if errors.Is(err, cluster.ErrVersionConflict) {
+				s.writeESError(w, r, http.StatusConflict, "version_conflict_engine_exception", err.Error())
+				return
+			}
 			s.writeESError(w, r, http.StatusInternalServerError, "index_failed_exception", err.Error())
 			return
 		}
 		status := http.StatusCreated
 		result := "created"
-		if docID != "" {
+		if docID != "" && !strings.EqualFold(opType, "create") {
 			status = http.StatusOK
 			result = "updated"
 		}
@@ -521,6 +756,26 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 					return
 				}
 				docBytes := append([]byte(nil), bytes.TrimSpace(scanner.Bytes())...)
+				var docCheck map[string]any
+				if err := json.Unmarshal(docBytes, &docCheck); err != nil || docCheck == nil {
+					hasErrors = true
+					reason := "document body must be a JSON object"
+					if err != nil {
+						reason = err.Error()
+					}
+					items = append(items, map[string]any{
+						opName: map[string]any{
+							"_index": idxName,
+							"_id":    docID,
+							"status": http.StatusBadRequest,
+							"error": map[string]any{
+								"type":   "mapper_parsing_exception",
+								"reason": reason,
+							},
+						},
+					})
+					continue
+				}
 				if opName == "update" {
 					var partial struct {
 						Doc map[string]any `json:"doc"`
@@ -536,7 +791,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 						docBytes, _ = json.Marshal(existing)
 					}
 				}
-				id, _, crc, seq, err := s.node.IndexDoc(r.Context(), idxName, docID, docBytes, routing)
+				opType := ""
+				if opName == "create" {
+					opType = "create"
+				}
+				id, _, crc, seq, err := s.node.IndexDocWithOpType(r.Context(), idxName, docID, docBytes, routing, opType)
 				entry := map[string]any{
 					"_index":  idxName,
 					"_id":     id,
@@ -547,8 +806,17 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 				}
 				if err != nil {
 					hasErrors = true
-					entry["status"] = 500
-					entry["error"] = err.Error()
+					if errors.Is(err, cluster.ErrVersionConflict) {
+						entry["_id"] = docID
+						entry["status"] = http.StatusConflict
+						entry["error"] = map[string]any{
+							"type":   "version_conflict_engine_exception",
+							"reason": err.Error(),
+						}
+					} else {
+						entry["status"] = 500
+						entry["error"] = err.Error()
+					}
 				}
 				items = append(items, map[string]any{opName: entry})
 			}
@@ -614,8 +882,45 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, indexNames
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
+func (s *Server) handleCount(w http.ResponseWriter, r *http.Request, indexNames []string) {
+	var body struct {
+		Query map[string]any `json:"query"`
+	}
+	if r.Body != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err == nil && len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				s.writeESError(w, r, http.StatusBadRequest, "parsing_exception", err.Error())
+				return
+			}
+		}
+	}
+	if qParam := r.URL.Query().Get("q"); qParam != "" && len(body.Query) == 0 {
+		body.Query = map[string]any{
+			"query_string": map[string]any{"query": qParam},
+		}
+	}
+	preferReader := strings.EqualFold(r.URL.Query().Get("preference"), "reader") ||
+		strings.EqualFold(r.Header.Get("X-Cinder-Preference"), "reader")
+
+	resp, err := s.node.Count(r.Context(), indexNames, body.Query, preferReader)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "index_not_found_exception") {
+			status = http.StatusNotFound
+		}
+		s.writeESError(w, r, status, "search_phase_execution_exception", err.Error())
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
 func (s *Server) writeJSON(w http.ResponseWriter, r *http.Request, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
+	contentType := "application/json"
+	if r != nil && strings.Contains(r.Header.Get("Accept"), "application/vnd.elasticsearch+json") {
+		contentType = "application/vnd.elasticsearch+json; compatible-with=8"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)

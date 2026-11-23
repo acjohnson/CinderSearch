@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +40,15 @@ const (
 	RetrievalHybrid RetrievalMode = "hybrid"
 )
 
+// ErrVersionConflict is returned when op_type=create targets an existing document ID (HTTP 409).
+var ErrVersionConflict = errors.New("version_conflict_engine_exception")
+
+const clusterIndexMetaPrefix = "_cluster/indices/"
+
+func clusterIndexMetaKey(indexName string) string {
+	return clusterIndexMetaPrefix + indexName + ".json"
+}
+
 // NodeConfig configures a CinderSearch cluster node.
 type NodeConfig struct {
 	NodeID            string
@@ -64,7 +74,16 @@ type IndexMetadata struct {
 	Name      string         `json:"name"`
 	Settings  IndexSettings  `json:"settings"`
 	Mappings  map[string]any `json:"mappings,omitempty"`
+	Aliases   []string       `json:"aliases,omitempty"`
 	CreatedAt int64          `json:"created_at"`
+}
+
+// AliasAction represents a single add/remove operation in POST /_aliases.
+type AliasAction struct {
+	Action  string   // "add" or "remove"
+	Index   string   // single index or wildcard pattern
+	Indices []string // optional list of indices or patterns
+	Alias   string   // alias name
 }
 
 // S3Pointer provides clients with a zero-hop direct S3 HTTP Range pointer + CRC32C checksum.
@@ -202,6 +221,11 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		stopCh:  make(chan struct{}),
 	}
 
+	// Cold-boot recovery: hydrate persisted index metadata, mappings, and aliases from S3.
+	if n.s3 != nil && len(n.ring.DataNodes()) > 0 {
+		_ = n.LoadClusterMetadataFromS3(context.Background())
+	}
+
 	if n.HasRole(sharding.RoleData) {
 		n.wg.Add(2)
 		go n.replicationLoop()
@@ -272,10 +296,67 @@ func (n *Node) Close() error {
 	return nil
 }
 
-// CreateIndex registers an index across the cluster and opens its primary/replica shards locally.
+// LoadClusterMetadataFromS3 restores persisted index definitions, mappings, and aliases from S3
+// and opens role-appropriate shard handles on this node.
+func (n *Node) LoadClusterMetadataFromS3(ctx context.Context) error {
+	if n.s3 == nil {
+		return nil
+	}
+	objs, err := n.s3.ListObjects(ctx, clusterIndexMetaPrefix)
+	if err != nil {
+		return err
+	}
+	for _, obj := range objs {
+		if !strings.HasSuffix(obj.Key, ".json") {
+			continue
+		}
+		raw, _, err := n.s3.GetObject(ctx, obj.Key)
+		if err != nil {
+			continue
+		}
+		var meta IndexMetadata
+		if err := json.Unmarshal(raw, &meta); err != nil || meta.Name == "" {
+			continue
+		}
+		if err := n.ApplyIndexMetadata(ctx, meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *Node) persistIndexMetadata(ctx context.Context, meta IndexMetadata) error {
+	if n.s3 == nil {
+		return nil
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	_, err = n.s3.PutObject(ctx, clusterIndexMetaKey(meta.Name), raw)
+	return err
+}
+
+func (n *Node) deletePersistedIndexMetadata(ctx context.Context, indexName string) error {
+	if n.s3 == nil {
+		return nil
+	}
+	return n.s3.DeleteObject(ctx, clusterIndexMetaKey(indexName))
+}
+
+func (n *Node) broadcastIndexMetadata(ctx context.Context, meta IndexMetadata) {
+	for _, peer := range n.ring.Nodes() {
+		if peer.ID == n.cfg.NodeID || peer.Address == "" {
+			continue
+		}
+		_ = n.postJSON(ctx, baseURL(peer.Address)+"/_internal/index/sync", meta, nil)
+	}
+}
+
+// CreateIndex registers an index across the cluster, persists metadata to S3, and opens shards locally.
 func (n *Node) CreateIndex(ctx context.Context, meta IndexMetadata, broadcast bool) error {
-	if meta.Name == "" {
-		return fmt.Errorf("index name is required")
+	if err := validateIndexName(meta.Name); err != nil {
+		return err
 	}
 	if meta.Settings.NumberOfShards <= 0 {
 		meta.Settings.NumberOfShards = 3
@@ -286,18 +367,17 @@ func (n *Node) CreateIndex(ctx context.Context, meta IndexMetadata, broadcast bo
 	if meta.CreatedAt == 0 {
 		meta.CreatedAt = time.Now().UTC().UnixMilli()
 	}
+	meta.Aliases = normalizeStringSet(meta.Aliases)
 
 	if err := n.ApplyIndexMetadata(ctx, meta); err != nil {
 		return err
 	}
+	if err := n.persistIndexMetadata(ctx, meta); err != nil {
+		return err
+	}
 
 	if broadcast {
-		for _, peer := range n.ring.Nodes() {
-			if peer.ID == n.cfg.NodeID || peer.Address == "" {
-				continue
-			}
-			_ = n.postJSON(ctx, baseURL(peer.Address)+"/_internal/index/sync", meta, nil)
-		}
+		n.broadcastIndexMetadata(ctx, meta)
 	}
 	return nil
 }
@@ -383,6 +463,7 @@ func (n *Node) DeleteIndex(ctx context.Context, indexName string, broadcast bool
 		_ = sh.Close()
 	}
 	if broadcast {
+		_ = n.deletePersistedIndexMetadata(ctx, indexName)
 		for _, peer := range n.ring.Nodes() {
 			if peer.ID == n.cfg.NodeID || peer.Address == "" {
 				continue
@@ -419,6 +500,331 @@ func (n *Node) ListIndices() []IndexMetadata {
 	return out
 }
 
+// PutMapping merges mapping definitions into an existing index, persists to S3, and broadcasts to peers.
+func (n *Node) PutMapping(ctx context.Context, indexName string, mappings map[string]any, broadcast bool) error {
+	meta, ok := n.GetIndex(indexName)
+	if !ok {
+		return fmt.Errorf("index_not_found_exception: %s", indexName)
+	}
+	if meta.Mappings == nil {
+		meta.Mappings = make(map[string]any)
+	}
+	for k, v := range mappings {
+		if k == "properties" {
+			newProps, okNew := v.(map[string]any)
+			oldProps, okOld := meta.Mappings["properties"].(map[string]any)
+			if okNew && okOld {
+				merged := make(map[string]any, len(oldProps)+len(newProps))
+				for pk, pv := range oldProps {
+					merged[pk] = pv
+				}
+				for pk, pv := range newProps {
+					merged[pk] = pv
+				}
+				meta.Mappings["properties"] = merged
+				continue
+			}
+		}
+		meta.Mappings[k] = v
+	}
+
+	n.mu.Lock()
+	n.indices[indexName] = meta
+	n.mu.Unlock()
+
+	if err := n.persistIndexMetadata(ctx, meta); err != nil {
+		return err
+	}
+	if broadcast {
+		n.broadcastIndexMetadata(ctx, meta)
+	}
+	return nil
+}
+
+// UpdateAliases atomically applies add/remove alias actions, persists modified index metadata to S3,
+// and broadcasts updates to cluster peers.
+func (n *Node) UpdateAliases(ctx context.Context, actions []AliasAction, broadcast bool) error {
+	if len(actions) == 0 {
+		return fmt.Errorf("at least one alias action is required")
+	}
+
+	n.mu.Lock()
+	working := make(map[string]IndexMetadata, len(n.indices))
+	for k, v := range n.indices {
+		cp := v
+		cp.Aliases = append([]string(nil), v.Aliases...)
+		working[k] = cp
+	}
+	n.mu.Unlock()
+
+	modified := make(map[string]struct{})
+	for _, act := range actions {
+		alias := strings.TrimSpace(act.Alias)
+		if alias == "" {
+			return fmt.Errorf("alias name is required")
+		}
+		var patterns []string
+		if act.Index != "" {
+			patterns = append(patterns, strings.Split(act.Index, ",")...)
+		}
+		patterns = append(patterns, act.Indices...)
+		if len(patterns) == 0 {
+			return fmt.Errorf("index pattern is required for alias %q", alias)
+		}
+
+		targets, err := resolveIndicesFromMap(working, patterns)
+		if err != nil {
+			return err
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("index_not_found_exception: %s", strings.Join(patterns, ","))
+		}
+
+		for _, idxName := range targets {
+			meta := working[idxName]
+			switch strings.ToLower(act.Action) {
+			case "add":
+				meta.Aliases = normalizeStringSet(append(meta.Aliases, alias))
+			case "remove":
+				filtered := make([]string, 0, len(meta.Aliases))
+				for _, a := range meta.Aliases {
+					if a != alias {
+						filtered = append(filtered, a)
+					}
+				}
+				meta.Aliases = filtered
+			default:
+				return fmt.Errorf("unsupported alias action %q", act.Action)
+			}
+			working[idxName] = meta
+			modified[idxName] = struct{}{}
+		}
+	}
+
+	n.mu.Lock()
+	for idxName := range modified {
+		n.indices[idxName] = working[idxName]
+	}
+	n.mu.Unlock()
+
+	for idxName := range modified {
+		meta := working[idxName]
+		if err := n.persistIndexMetadata(ctx, meta); err != nil {
+			return err
+		}
+		if broadcast {
+			n.broadcastIndexMetadata(ctx, meta)
+		}
+	}
+	return nil
+}
+
+// GetAliases returns Elasticsearch-formatted alias mappings for matching indices or alias names.
+func (n *Node) GetAliases(indexPatterns []string, aliasFilter string) map[string]any {
+	indices := n.ListIndices()
+	out := make(map[string]any)
+	for _, meta := range indices {
+		if len(indexPatterns) > 0 {
+			matched := false
+			for _, pat := range indexPatterns {
+				if pat == "_all" || pat == "*" || matchWildcard(pat, meta.Name) {
+					matched = true
+					break
+				}
+				for _, a := range meta.Aliases {
+					if matchWildcard(pat, a) {
+						matched = true
+						break
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		aliasesObj := make(map[string]any)
+		for _, a := range meta.Aliases {
+			if aliasFilter != "" && !matchWildcard(aliasFilter, a) {
+				continue
+			}
+			aliasesObj[a] = map[string]any{}
+		}
+		if aliasFilter != "" && len(aliasesObj) == 0 {
+			continue
+		}
+		out[meta.Name] = map[string]any{
+			"aliases": aliasesObj,
+		}
+	}
+	return out
+}
+
+// HasIndexOrAlias reports whether any index or alias matches pattern (used by HEAD /{index}).
+func (n *Node) HasIndexOrAlias(pattern string) bool {
+	resolved, err := n.ResolveIndices([]string{pattern})
+	return err == nil && len(resolved) > 0
+}
+
+// ResolveIndices expands index names, aliases, _all, glob wildcards (* and ?), and -exclusions
+// matching Elasticsearch multi-index resolution semantics.
+func (n *Node) ResolveIndices(patterns []string) ([]string, error) {
+	n.mu.RLock()
+	snapshot := make(map[string]IndexMetadata, len(n.indices))
+	for k, v := range n.indices {
+		snapshot[k] = v
+	}
+	n.mu.RUnlock()
+	return resolveIndicesFromMap(snapshot, patterns)
+}
+
+func resolveIndicesFromMap(indices map[string]IndexMetadata, patterns []string) ([]string, error) {
+	allNames := make([]string, 0, len(indices))
+	for name := range indices {
+		allNames = append(allNames, name)
+	}
+	sort.Strings(allNames)
+
+	if len(patterns) == 0 {
+		return allNames, nil
+	}
+
+	selected := make(map[string]struct{})
+	for _, raw := range patterns {
+		pat := strings.TrimSpace(raw)
+		if pat == "" {
+			continue
+		}
+		exclude := false
+		if strings.HasPrefix(pat, "-") {
+			exclude = true
+			pat = strings.TrimPrefix(pat, "-")
+			if pat == "" {
+				continue
+			}
+		}
+
+		isWildcard := pat == "_all" || strings.ContainsAny(pat, "*?")
+		var matched []string
+		if pat == "_all" || pat == "*" {
+			matched = allNames
+		} else if isWildcard {
+			for _, name := range allNames {
+				if matchWildcard(pat, name) {
+					matched = append(matched, name)
+					continue
+				}
+				for _, alias := range indices[name].Aliases {
+					if matchWildcard(pat, alias) {
+						matched = append(matched, name)
+						break
+					}
+				}
+			}
+		} else {
+			if _, ok := indices[pat]; ok {
+				matched = append(matched, pat)
+			} else {
+				for _, name := range allNames {
+					for _, alias := range indices[name].Aliases {
+						if alias == pat {
+							matched = append(matched, name)
+							break
+						}
+					}
+				}
+			}
+			if len(matched) == 0 && !exclude {
+				return nil, fmt.Errorf("index_not_found_exception: %s", pat)
+			}
+		}
+
+		if exclude {
+			for _, name := range matched {
+				delete(selected, name)
+			}
+		} else {
+			for _, name := range matched {
+				selected[name] = struct{}{}
+			}
+		}
+	}
+
+	out := make([]string, 0, len(selected))
+	for name := range selected {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func matchWildcard(pattern, s string) bool {
+	p, t := []rune(pattern), []rune(s)
+	pi, ti := 0, 0
+	starIdx, matchIdx := -1, 0
+	for ti < len(t) {
+		if pi < len(p) && (p[pi] == '?' || p[pi] == t[ti]) {
+			pi++
+			ti++
+		} else if pi < len(p) && p[pi] == '*' {
+			starIdx = pi
+			matchIdx = ti
+			pi++
+		} else if starIdx != -1 {
+			pi = starIdx + 1
+			matchIdx++
+			ti = matchIdx
+		} else {
+			return false
+		}
+	}
+	for pi < len(p) && p[pi] == '*' {
+		pi++
+	}
+	return pi == len(p)
+}
+
+func normalizeStringSet(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func validateIndexName(name string) error {
+	if name == "" {
+		return fmt.Errorf("index name is required")
+	}
+	if name == "." || name == ".." || len(name) > 255 {
+		return fmt.Errorf("invalid_index_name_exception: invalid index name [%s]", name)
+	}
+	if name[0] == '_' || name[0] == '-' || name[0] == '+' {
+		return fmt.Errorf("invalid_index_name_exception: index name [%s] must not start with '_', '-', or '+'", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("invalid_index_name_exception: invalid character %q in index name [%s]", r, name)
+	}
+	return nil
+}
+
 // EnsureIndex auto-creates an index with default settings on first write (matching ES behavior).
 func (n *Node) EnsureIndex(ctx context.Context, indexName string) (IndexMetadata, error) {
 	if meta, ok := n.GetIndex(indexName); ok {
@@ -440,6 +846,11 @@ func (n *Node) EnsureIndex(ctx context.Context, indexName string) (IndexMetadata
 // IndexDoc routes a document write to its primary shard node (local or remote),
 // computes CRC32C, writes to NVMe WAL, and returns immediately while async replication runs.
 func (n *Node) IndexDoc(ctx context.Context, indexName, docID string, rawJSON []byte, routing string) (string, int, uint32, uint64, error) {
+	return n.IndexDocWithOpType(ctx, indexName, docID, rawJSON, routing, "")
+}
+
+// IndexDocWithOpType supports Elasticsearch op_type=create (returning ErrVersionConflict if docID already exists).
+func (n *Node) IndexDocWithOpType(ctx context.Context, indexName, docID string, rawJSON []byte, routing, opType string) (string, int, uint32, uint64, error) {
 	meta, err := n.EnsureIndex(ctx, indexName)
 	if err != nil {
 		return "", 0, 0, 0, err
@@ -464,6 +875,15 @@ func (n *Node) IndexDoc(ctx context.Context, indexName, docID string, rawJSON []
 		if sh == nil {
 			return "", 0, 0, 0, fmt.Errorf("primary shard %s[%d] not initialized on %s", indexName, shardID, n.cfg.NodeID)
 		}
+		if strings.EqualFold(opType, "create") {
+			exists, err := sh.DocExists(ctx, docID)
+			if err != nil {
+				return "", 0, 0, 0, err
+			}
+			if exists {
+				return "", shardID, 0, 0, fmt.Errorf("%w: [%s]: document already exists", ErrVersionConflict, docID)
+			}
+		}
 		rec, err := sh.IndexLocal(docID, rawJSON)
 		if err != nil {
 			return "", 0, 0, 0, err
@@ -479,6 +899,9 @@ func (n *Node) IndexDoc(ctx context.Context, indexName, docID string, rawJSON []
 		Seq     uint64 `json:"_seq_no"`
 	}
 	target := fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing)
+	if strings.EqualFold(opType, "create") {
+		target += "&op_type=create"
+	}
 	if err := n.putJSONRaw(ctx, target, rawJSON, &resp); err != nil {
 		return "", 0, 0, 0, err
 	}
@@ -592,6 +1015,57 @@ func (n *Node) GetDoc(ctx context.Context, indexName, docID, routing string) ([]
 	return parsed.Source, parsed.Found, crc, parsed.S3Pointer, nil
 }
 
+// DocExists checks whether docID exists in indexName (supporting HEAD /{index}/_doc/{id}).
+func (n *Node) DocExists(ctx context.Context, indexName, docID, routing string) (bool, error) {
+	meta, ok := n.GetIndex(indexName)
+	if !ok {
+		return false, fmt.Errorf("index_not_found_exception: %s", indexName)
+	}
+	if routing == "" {
+		routing = docID
+	}
+	shardID := sharding.ShardForKey(indexName, routing, meta.Settings.NumberOfShards)
+	placement, err := n.ring.PlacementForShard(indexName, shardID, meta.Settings.NumberOfReplicas)
+	if err != nil {
+		return false, err
+	}
+
+	if placement.Primary.ID == n.cfg.NodeID {
+		n.mu.RLock()
+		sh := n.shards[indexName][shardID]
+		n.mu.RUnlock()
+		if sh == nil {
+			return false, nil
+		}
+		return sh.DocExists(ctx, docID)
+	}
+
+	n.mu.RLock()
+	localReplica := n.shards[indexName][shardID]
+	n.mu.RUnlock()
+	if localReplica != nil && !localReplica.readOnly {
+		return localReplica.DocExists(ctx, docID)
+	}
+
+	url := fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode >= 300 {
+		return false, fmt.Errorf("remote head doc failed (%d)", resp.StatusCode)
+	}
+	return true, nil
+}
+
 func (n *Node) getLocalDoc(ctx context.Context, indexName string, shardID int, docID string) ([]byte, bool, uint32, *S3Pointer, error) {
 	n.mu.RLock()
 	sh := n.shards[indexName][shardID]
@@ -674,6 +1148,23 @@ func (n *Node) Search(ctx context.Context, indexNames []string, req query.Search
 	return n.SearchWithPreference(ctx, indexNames, req, mode, false)
 }
 
+// Count returns the matching document count across indexPatterns without fetching _source payloads.
+func (n *Node) Count(ctx context.Context, indexPatterns []string, queryDSL map[string]any, preferReader bool) (map[string]any, error) {
+	zero := 0
+	res, err := n.SearchWithPreference(ctx, indexPatterns, query.SearchRequest{
+		Query: queryDSL,
+		Size:  &zero,
+	}, RetrievalDropIn, preferReader)
+	if err != nil {
+		return nil, err
+	}
+	total := res["hits"].(map[string]any)["total"].(map[string]any)["value"]
+	return map[string]any{
+		"count":   total,
+		"_shards": res["_shards"],
+	}, nil
+}
+
 // SearchWithPreference executes distributed search, optionally routing shard reads to stateless
 // reader-role nodes first (falling back to data nodes if no readers are available).
 func (n *Node) SearchWithPreference(ctx context.Context, indexNames []string, req query.SearchRequest, mode RetrievalMode, preferReader bool) (map[string]any, error) {
@@ -681,10 +1172,29 @@ func (n *Node) SearchWithPreference(ctx context.Context, indexNames []string, re
 	if mode == "" {
 		mode = RetrievalDropIn
 	}
-	if len(indexNames) == 0 {
-		for _, m := range n.ListIndices() {
-			indexNames = append(indexNames, m.Name)
-		}
+	resolvedIndices, err := n.ResolveIndices(indexNames)
+	if err != nil {
+		return nil, err
+	}
+	if len(resolvedIndices) == 0 {
+		return map[string]any{
+			"took":      time.Since(start).Milliseconds(),
+			"timed_out": false,
+			"_shards": map[string]any{
+				"total":      0,
+				"successful": 0,
+				"skipped":    0,
+				"failed":     0,
+			},
+			"hits": map[string]any{
+				"total": map[string]any{
+					"value":    0,
+					"relation": "eq",
+				},
+				"max_score": nil,
+				"hits":      []map[string]any{},
+			},
+		}, nil
 	}
 
 	aggsSpec := req.MergedAggs()
@@ -697,7 +1207,7 @@ func (n *Node) SearchWithPreference(ctx context.Context, indexNames []string, re
 		index string
 		p     sharding.Placement
 	}
-	for _, idxName := range indexNames {
+	for _, idxName := range resolvedIndices {
 		meta, ok := n.GetIndex(idxName)
 		if !ok {
 			return nil, fmt.Errorf("index_not_found_exception: %s", idxName)
@@ -1255,6 +1765,10 @@ func (n *Node) putJSONRaw(ctx context.Context, targetURL string, raw []byte, out
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("%w: %s", ErrVersionConflict, strings.TrimSpace(string(msg)))
+	}
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("put %s status %d: %s", targetURL, resp.StatusCode, strings.TrimSpace(string(msg)))

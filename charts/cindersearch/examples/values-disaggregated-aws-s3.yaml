@@ -85,6 +85,16 @@ reader:
       cpu: 4000m
       memory: 8Gi
 
+engine:
+  flushSec: 5
+  merge:
+    intervalSec: 30
+    maxSegmentsPerShard: 6
+    maxMergedSegmentMB: 128
+    maxConcurrent: 1
+    reclaimDeletesRatio: 0.20
+    s3GCGraceSec: 600
+
 ingress:
   enabled: true
   className: nginx

@@ -51,6 +51,12 @@ spec:
             - --nvme-dir={{ .Values.data.nvmeDir }}
             - --nvme-max-mb={{ .Values.data.nvmeMaxMB }}
             - --flush-sec={{ .Values.engine.flushSec }}
+            - --merge-interval-sec={{ .Values.engine.merge.intervalSec }}
+            - --merge-max-segments={{ .Values.engine.merge.maxSegmentsPerShard }}
+            - --merge-max-bytes-mb={{ .Values.engine.merge.maxMergedSegmentMB }}
+            - --merge-max-concurrent={{ .Values.engine.merge.maxConcurrent }}
+            - --merge-reclaim-deletes-ratio={{ .Values.engine.merge.reclaimDeletesRatio }}
+            - --s3-gc-grace-sec={{ .Values.engine.merge.s3GCGraceSec }}
             - --s3-bucket={{ .Values.s3.bucket }}
             - --s3-region={{ .Values.s3.region }}
             {{- if eq .Values.s3.mode "embedded" }}

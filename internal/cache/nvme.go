@@ -19,13 +19,13 @@ import (
 
 // Stats reports NVMe read cache hit/miss/eviction and bit-rot healing metrics.
 type Stats struct {
-	Entries       int   `json:"entries"`
-	UsedBytes     int64 `json:"used_bytes"`
-	MaxBytes      int64 `json:"max_bytes"`
-	Hits          int64 `json:"hits"`
-	Misses        int64 `json:"misses"`
-	Evictions     int64 `json:"evictions"`
-	BitRotHealed  int64 `json:"bitrot_healed"`
+	Entries      int   `json:"entries"`
+	UsedBytes    int64 `json:"used_bytes"`
+	MaxBytes     int64 `json:"max_bytes"`
+	Hits         int64 `json:"hits"`
+	Misses       int64 `json:"misses"`
+	Evictions    int64 `json:"evictions"`
+	BitRotHealed int64 `json:"bitrot_healed"`
 }
 
 type cacheEntry struct {
@@ -226,6 +226,11 @@ func (c *NVMeCache) GetRange(key string, offset, length int64) ([]byte, bool, er
 func (c *NVMeCache) InvalidateCorrupted(key string) {
 	c.removeEntry(key)
 	c.bitRotHealed.Add(1)
+}
+
+// Delete proactively removes an entry (such as a superseded segment after compaction) from NVMe cache.
+func (c *NVMeCache) Delete(key string) {
+	c.removeEntry(key)
 }
 
 // GetOrFetch checks the NVMe cache first and falls back to loader on cache miss or

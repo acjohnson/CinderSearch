@@ -19,6 +19,7 @@
   - Unsupported legacy ES roles (`master`, `ml`, `ingest`, `data_hot`/`warm`/`cold`/`frozen`, `transform`, `remote_cluster_client`) are explicitly rejected—leaderless ring metadata + S3 tiering replace master-only and hot/warm/cold splits.
 - **S3-Persisted Cluster Metadata & Cold-Boot Recovery**: Index settings, mappings, and aliases are persisted to `_cluster/indices/<name>.json` on S3 and automatically hydrated on node startup, enabling full cluster recovery even after total pod/NVMe loss.
 - **Official ES v8 Client Handshake, Aliases & Wildcards**: Emits `X-Elastic-Product: Elasticsearch` and negotiates `application/vnd.elasticsearch+json; compatible-with=8`; supports `HEAD /{index}`, `HEAD /{index}/_doc/{id}`, `PUT /{index}/_create/{id}` / `?op_type=create` (`409 Conflict`), `GET/PUT /{index}/_mapping`, `GET/POST /_count`, atomic `POST /_aliases`, `/{index}/_alias/{name}`, and wildcard/exclusion index resolution (`logs-*,-logs-debug*`, `_all`).
+- **Lucene-Style S3 Segment Merging, Deterministic Tombstone GC & `_forcemerge`**: Background `TieredMergePolicy` tuned for latency-sensitive catalog & application search (`--merge-max-segments=6`, `--merge-max-bytes-mb=128`, `--merge-max-concurrent=1`, `--merge-reclaim-deletes-ratio=0.20`). Merges write directly to S3 with atomic `manifest.json` swap, pre-warm the NVMe cache before exposing new segments (preventing cold-cache cliffs), deterministically purge tombstones at base segment `0` (zero zombie resurrection), and defer S3 deletion of retired segments behind a `--s3-gc-grace-sec=600` grace window (`> 5m` presigned URL TTL). Supports `POST /{index}/_forcemerge`, `GET /{index}/_segments`, and `GET /_cat/segments`.
 - **Bit-Rot Protection**: Every WAL frame, replica stream, NVMe cache entry, S3 segment footer, and `_s3_pointer` carries a Castagnoli `CRC32C` digest. Corrupted NVMe cache entries are quarantined and automatically healed from S3.
 
 ## Quickstart
@@ -115,6 +116,12 @@ curl -X POST 'http://localhost:9200/logs/_search?preference=reader' -H 'Content-
 curl -X POST 'http://localhost:9200/logs/_search?retrieval=presigned' -H 'Content-Type: application/json' -d '{
   "query": { "match_all": {} }
 }'
+
+# Inspect S3 segments & run on-demand Lucene-style compaction / tombstone expunge
+curl http://localhost:9200/_cat/segments/logs
+curl http://localhost:9200/logs/_segments
+curl -X POST 'http://localhost:9200/logs/_forcemerge?max_num_segments=1'
+curl -X POST 'http://localhost:9200/logs/_forcemerge?only_expunge_deletes=true'
 ```
 
 ## Kubernetes Deployment (Helm Chart)

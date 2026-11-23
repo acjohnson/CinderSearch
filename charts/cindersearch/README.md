@@ -95,6 +95,12 @@ helm template cindersearch ./charts/cindersearch -f ./charts/cindersearch/exampl
 | `reader.enabled` | `false` | Deploy stateless S3+NVMe `reader` search pool |
 | `reader.replicaCount` | `2` | Number of `reader` pods when enabled |
 | `engine.flushSec` | `5` | Background WAL-to-S3 segment flush interval (seconds) |
+| `engine.merge.intervalSec` | `30` | Background Lucene-style tiered segment merge & S3 GC sweep interval (seconds) |
+| `engine.merge.maxSegmentsPerShard` | `6` | Target max active S3 segments per shard before tiered merging (catalog-search low fan-out) |
+| `engine.merge.maxMergedSegmentMB` | `128` | Max merged segment size cap (MB); prevents rewriting large segments |
+| `engine.merge.maxConcurrent` | `1` | Strict merge concurrency cap per data pod protecting search p99 latency |
+| `engine.merge.reclaimDeletesRatio` | `0.20` | Tombstone ratio threshold `(0..1]` triggering deterministic delete reclamation |
+| `engine.merge.s3GCGraceSec` | `600` | Grace period (seconds) before deleting retired S3 segment objects (`> 300s` presigned URL TTL) |
 | `engine.pprof.enabled` | `false` | Enable Go pprof debug listener on port `6060` |
 | `ingress.enabled` | `false` | Create `networking.k8s.io/v1` Ingress for client API |
 | `networkPolicy.enabled` | `false` | Create Kubernetes NetworkPolicy restricting pod traffic |

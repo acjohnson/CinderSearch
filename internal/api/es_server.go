@@ -76,6 +76,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/_cat/shards" && r.Method == http.MethodGet:
 		s.handleCatShards(w, r)
 		return
+	case (path == "/_cat/segments" || strings.HasPrefix(path, "/_cat/segments/")) && r.Method == http.MethodGet:
+		var patterns []string
+		if strings.HasPrefix(path, "/_cat/segments/") {
+			patterns = strings.Split(strings.TrimPrefix(path, "/_cat/segments/"), ",")
+		}
+		s.handleCatSegments(w, r, patterns)
+		return
+	case path == "/_segments" && r.Method == http.MethodGet:
+		s.handleSegments(w, r, nil)
+		return
+	case path == "/_forcemerge" && r.Method == http.MethodPost:
+		s.handleForceMerge(w, r, nil)
+		return
 	case path == "/_cinder/stats" && r.Method == http.MethodGet:
 		s.writeJSON(w, r, http.StatusOK, s.node.Stats())
 		return
@@ -165,6 +178,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "_count":
 		indices := strings.Split(indexName, ",")
 		s.handleCount(w, r, indices)
+	case "_forcemerge":
+		if r.Method != http.MethodPost {
+			s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
+			return
+		}
+		s.handleForceMerge(w, r, strings.Split(indexName, ","))
+	case "_segments":
+		if r.Method != http.MethodGet {
+			s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
+			return
+		}
+		s.handleSegments(w, r, strings.Split(indexName, ","))
 	case "_mapping", "_mappings":
 		s.handleMapping(w, r, indexName)
 	case "_alias", "_aliases":
@@ -250,6 +275,23 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, path str
 			return
 		}
 		s.writeJSON(w, r, http.StatusOK, hits)
+
+	case "/_internal/forcemerge":
+		var req cluster.ForceMergeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.writeESError(w, r, http.StatusBadRequest, "json_parse_exception", err.Error())
+			return
+		}
+		sum, err := s.node.ForceMergeLocal(r.Context(), req.IndexName, req.Options)
+		if err != nil {
+			s.writeESError(w, r, http.StatusInternalServerError, "forcemerge_error", err.Error())
+			return
+		}
+		s.writeJSON(w, r, http.StatusOK, sum)
+
+	case "/_internal/segments":
+		idx := r.URL.Query().Get("index")
+		s.writeJSON(w, r, http.StatusOK, s.node.LocalShardSegments(idx))
 
 	default:
 		s.writeESError(w, r, http.StatusNotFound, "no_such_route", path)
@@ -360,6 +402,59 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.writeJSON(w, r, http.StatusOK, out)
+}
+
+func (s *Server) handleForceMerge(w http.ResponseWriter, r *http.Request, indexPatterns []string) {
+	q := r.URL.Query()
+	opts := cluster.ForceMergeOptions{
+		MaxNumSegments:     1,
+		OnlyExpungeDeletes: q.Get("only_expunge_deletes") == "true",
+		Flush:              q.Get("flush") != "false",
+	}
+	if v := q.Get("max_num_segments"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "max_num_segments must be >= 1")
+			return
+		}
+		opts.MaxNumSegments = n
+	}
+	res, err := s.node.ForceMerge(r.Context(), indexPatterns, opts)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "index_not_found_exception") {
+			status = http.StatusNotFound
+		}
+		s.writeESError(w, r, status, "forcemerge_exception", err.Error())
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, res)
+}
+
+func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request, indexPatterns []string) {
+	res, err := s.node.IndexSegments(r.Context(), indexPatterns)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "index_not_found_exception") {
+			status = http.StatusNotFound
+		}
+		s.writeESError(w, r, status, "segments_exception", err.Error())
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, res)
+}
+
+func (s *Server) handleCatSegments(w http.ResponseWriter, r *http.Request, indexPatterns []string) {
+	res, err := s.node.CatSegments(r.Context(), indexPatterns)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "index_not_found_exception") {
+			status = http.StatusNotFound
+		}
+		s.writeESError(w, r, status, "segments_exception", err.Error())
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, res)
 }
 
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, indexName string) {

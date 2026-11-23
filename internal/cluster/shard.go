@@ -20,23 +20,36 @@ import (
 
 // SegmentRef describes an immutable segment persisted on S3 in the shard manifest.
 type SegmentRef struct {
-	ID         string `json:"id"`
-	IdxKey     string `json:"idx_key"`
-	DocsKey    string `json:"docs_key"`
-	IdxCRC32C  uint32 `json:"idx_crc32c"`
-	DocsCRC32C uint32 `json:"docs_crc32c"`
-	DocCount   int    `json:"doc_count"`
-	MinSeq     uint64 `json:"min_seq"`
-	MaxSeq     uint64 `json:"max_seq"`
-	CreatedAt  int64  `json:"created_at"`
+	ID           string `json:"id"`
+	IdxKey       string `json:"idx_key"`
+	DocsKey      string `json:"docs_key"`
+	IdxCRC32C    uint32 `json:"idx_crc32c"`
+	DocsCRC32C   uint32 `json:"docs_crc32c"`
+	DocCount     int    `json:"doc_count"`
+	DeletedCount int    `json:"deleted_count,omitempty"`
+	SizeBytes    int64  `json:"size_bytes,omitempty"`
+	MinSeq       uint64 `json:"min_seq"`
+	MaxSeq       uint64 `json:"max_seq"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+// RetiredSegmentRef tracks a superseded segment awaiting delayed S3 deletion after the GC grace window.
+type RetiredSegmentRef struct {
+	ID        string `json:"id"`
+	IdxKey    string `json:"idx_key"`
+	DocsKey   string `json:"docs_key"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+	RetiredAt int64  `json:"retired_at"`
 }
 
 // ShardManifest is the authoritative S3 metadata listing all immutable segments for a shard.
 type ShardManifest struct {
-	IndexName  string       `json:"index_name"`
-	ShardID    int          `json:"shard_id"`
-	FlushedSeq uint64       `json:"flushed_seq"`
-	Segments   []SegmentRef `json:"segments"`
+	IndexName       string              `json:"index_name"`
+	ShardID         int                 `json:"shard_id"`
+	FlushedSeq      uint64              `json:"flushed_seq"`
+	NextSegCounter  int                 `json:"next_seg_counter,omitempty"`
+	Segments        []SegmentRef        `json:"segments"`
+	RetiredSegments []RetiredSegmentRef `json:"retired_segments,omitempty"`
 }
 
 // Shard manages one logical shard (primary or replica) backed by an NVMe WAL write buffer,
@@ -53,20 +66,22 @@ type Shard struct {
 	nvmeCache *cache.NVMeCache
 	s3        *s3store.Client
 
-	memDocs    map[string]wal.Record // uncommitted/WAL-backed latest doc state
-	memSeg     *segment.Segment      // NRT in-memory segment built from memDocs
-	memDirty   bool
-	flushedSeq uint64
-	segments   []SegmentRef
-	segCounter int
+	memDocs         map[string]wal.Record // uncommitted/WAL-backed latest doc state
+	memSeg          *segment.Segment      // NRT in-memory segment built from memDocs
+	memDirty        bool
+	flushedSeq      uint64
+	segments        []SegmentRef
+	retiredSegments []RetiredSegmentRef
+	segCounter      int
+	manifestVer     uint64
 
 	replicaAckSeq map[string]uint64 // peerNodeID -> last replicated WAL seq
 	lastWriteAt   atomic.Int64
 
-	segCacheMu         sync.RWMutex
-	decodedSegs        map[string]*segment.Segment // idxKey -> cached decoded immutable segment
-	committedLatestSeq map[string]uint64           // highest seq across committed segments
-	committedSeqSegCnt int                         // len(segments) when committedLatestSeq was built
+	segCacheMu           sync.RWMutex
+	decodedSegs          map[string]*segment.Segment // idxKey -> cached decoded immutable segment
+	committedLatestSeq   map[string]uint64           // highest seq across committed segments
+	committedManifestVer uint64                      // manifestVer when committedLatestSeq was built
 }
 
 // OpenShard initializes a shard's NVMe WAL, replays uncommitted frames into the NRT buffer,
@@ -107,7 +122,9 @@ func OpenShard(
 			if jsonErr := json.Unmarshal(data, &man); jsonErr == nil {
 				sh.flushedSeq = man.FlushedSeq
 				sh.segments = man.Segments
-				sh.segCounter = len(man.Segments)
+				sh.retiredSegments = man.RetiredSegments
+				sh.segCounter = manifestSegCounter(man)
+				sh.manifestVer = 1
 			}
 		} else if !errors.Is(err, s3store.ErrNotFound) {
 			_ = w.Close()
@@ -158,7 +175,9 @@ func OpenReadOnlyShard(
 			if jsonErr := json.Unmarshal(data, &man); jsonErr == nil {
 				sh.flushedSeq = man.FlushedSeq
 				sh.segments = man.Segments
-				sh.segCounter = len(man.Segments)
+				sh.retiredSegments = man.RetiredSegments
+				sh.segCounter = manifestSegCounter(man)
+				sh.manifestVer = 1
 			}
 		} else if !errors.Is(err, s3store.ErrNotFound) {
 			return nil, fmt.Errorf("load readonly shard manifest: %w", err)
@@ -340,15 +359,17 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	}
 
 	ref := SegmentRef{
-		ID:         segID,
-		IdxKey:     idxKey,
-		DocsKey:    docsKey,
-		IdxCRC32C:  idxCRC,
-		DocsCRC32C: docsCRC,
-		DocCount:   seg.LiveDocs,
-		MinSeq:     seg.MinSeq,
-		MaxSeq:     maxSeq,
-		CreatedAt:  time.Now().UTC().Unix(),
+		ID:           segID,
+		IdxKey:       idxKey,
+		DocsKey:      docsKey,
+		IdxCRC32C:    idxCRC,
+		DocsCRC32C:   docsCRC,
+		DocCount:     seg.LiveDocs,
+		DeletedCount: len(seg.Tombstones),
+		SizeBytes:    int64(len(idxBytes) + len(docsBytes)),
+		MinSeq:       seg.MinSeq,
+		MaxSeq:       maxSeq,
+		CreatedAt:    time.Now().UTC().Unix(),
 	}
 
 	// Build and persist authoritative S3 manifest BEFORE mutating local memDocs or compacting WAL.
@@ -361,13 +382,16 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	nextSegments := make([]SegmentRef, len(s.segments)+1)
 	copy(nextSegments, s.segments)
 	nextSegments[len(s.segments)] = ref
+	retiredSnapshot := append([]RetiredSegmentRef(nil), s.retiredSegments...)
 	s.mu.RUnlock()
 
 	man := ShardManifest{
-		IndexName:  s.indexName,
-		ShardID:    s.shardID,
-		FlushedSeq: nextFlushedSeq,
-		Segments:   nextSegments,
+		IndexName:       s.indexName,
+		ShardID:         s.shardID,
+		FlushedSeq:      nextFlushedSeq,
+		NextSegCounter:  nextCounter,
+		Segments:        nextSegments,
+		RetiredSegments: retiredSnapshot,
 	}
 	manBytes, err := json.Marshal(man)
 	if err != nil {
@@ -386,12 +410,13 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	s.segCacheMu.Lock()
 	s.decodedSegs[idxKey] = seg
 	s.committedLatestSeq = nil
-	s.committedSeqSegCnt = 0
+	s.committedManifestVer = 0
 	s.segCacheMu.Unlock()
 
 	s.mu.Lock()
 	s.segCounter = nextCounter
 	s.segments = nextSegments
+	s.manifestVer++
 	for docID, rec := range s.memDocs {
 		if fSeq, ok := flushedSeqs[docID]; ok && rec.Seq <= fSeq {
 			delete(s.memDocs, docID)
@@ -430,9 +455,11 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 	dirty := s.memDirty
 	var mem *segment.Segment
 	var refs []SegmentRef
+	var curManifestVer uint64
 	if !dirty {
 		mem = s.memSeg
 		refs = append([]SegmentRef(nil), s.segments...)
+		curManifestVer = s.manifestVer
 	}
 	s.mu.RUnlock()
 
@@ -446,22 +473,37 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 		}
 		mem = s.memSeg
 		refs = append([]SegmentRef(nil), s.segments...)
+		curManifestVer = s.manifestVer
 		s.mu.Unlock()
 	}
 
-	// Sync manifest from S3 if we are a replica or newly joined reader.
+	// Sync manifest from S3 if we are a replica or stateless reader (handles both flushes and merges).
 	if s.s3 != nil && !s.isPrimary {
 		if data, _, err := s.s3.GetObject(ctx, manifestKey(s.indexName, s.shardID)); err == nil {
 			var man ShardManifest
-			if json.Unmarshal(data, &man) == nil && len(man.Segments) > len(refs) {
+			if json.Unmarshal(data, &man) == nil && !segmentRefsEqual(man.Segments, refs) {
 				refs = man.Segments
 				s.mu.Lock()
 				s.segments = man.Segments
 				s.flushedSeq = man.FlushedSeq
+				s.retiredSegments = man.RetiredSegments
+				s.segCounter = manifestSegCounter(man)
+				s.manifestVer++
+				curManifestVer = s.manifestVer
 				s.mu.Unlock()
+
+				activeIdxKeys := make(map[string]struct{}, len(refs))
+				for _, r := range refs {
+					activeIdxKeys[r.IdxKey] = struct{}{}
+				}
 				s.segCacheMu.Lock()
+				for k := range s.decodedSegs {
+					if _, keep := activeIdxKeys[k]; !keep {
+						delete(s.decodedSegs, k)
+					}
+				}
 				s.committedLatestSeq = nil
-				s.committedSeqSegCnt = 0
+				s.committedManifestVer = 0
 				s.segCacheMu.Unlock()
 			}
 		}
@@ -522,7 +564,7 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 	var baseSeq map[string]uint64
 	if len(committedSegs) > 0 {
 		s.segCacheMu.RLock()
-		if s.committedLatestSeq != nil && s.committedSeqSegCnt == len(refs) {
+		if s.committedLatestSeq != nil && s.committedManifestVer == curManifestVer {
 			baseSeq = s.committedLatestSeq
 		}
 		s.segCacheMu.RUnlock()
@@ -543,7 +585,7 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 			}
 			s.segCacheMu.Lock()
 			s.committedLatestSeq = built
-			s.committedSeqSegCnt = len(refs)
+			s.committedManifestVer = curManifestVer
 			s.segCacheMu.Unlock()
 			baseSeq = built
 		}
@@ -678,16 +720,18 @@ func (s *Shard) DocExists(ctx context.Context, docID string) (bool, error) {
 	return false, nil
 }
 
-// Stats returns shard-level diagnostics.
+// ShardStats returns shard-level diagnostics.
 type ShardStats struct {
-	IndexName    string       `json:"index"`
-	ShardID      int          `json:"shard_id"`
-	IsPrimary    bool         `json:"is_primary"`
-	ReadOnly     bool         `json:"read_only,omitempty"`
-	WALLength    int          `json:"wal_buffered_ops"`
-	FlushedSeq   uint64       `json:"flushed_seq"`
-	SegmentCount int          `json:"s3_segments"`
-	Segments     []SegmentRef `json:"segments"`
+	IndexName         string       `json:"index"`
+	ShardID           int          `json:"shard_id"`
+	IsPrimary         bool         `json:"is_primary"`
+	ReadOnly          bool         `json:"read_only,omitempty"`
+	WALLength         int          `json:"wal_buffered_ops"`
+	FlushedSeq        uint64       `json:"flushed_seq"`
+	SegmentCount      int          `json:"s3_segments"`
+	TotalSegmentBytes int64        `json:"total_segment_bytes"`
+	PendingGCObjects  int          `json:"pending_gc_objects"`
+	Segments          []SegmentRef `json:"segments"`
 }
 
 // Stats returns a snapshot of the shard's WAL and S3 segment state.
@@ -698,15 +742,21 @@ func (s *Shard) Stats() ShardStats {
 	if s.wal != nil {
 		walLen = s.wal.Len()
 	}
+	var totalBytes int64
+	for _, seg := range s.segments {
+		totalBytes += seg.SizeBytes
+	}
 	return ShardStats{
-		IndexName:    s.indexName,
-		ShardID:      s.shardID,
-		IsPrimary:    s.isPrimary,
-		ReadOnly:     s.readOnly,
-		WALLength:    walLen,
-		FlushedSeq:   s.flushedSeq,
-		SegmentCount: len(s.segments),
-		Segments:     append([]SegmentRef(nil), s.segments...),
+		IndexName:         s.indexName,
+		ShardID:           s.shardID,
+		IsPrimary:         s.isPrimary,
+		ReadOnly:          s.readOnly,
+		WALLength:         walLen,
+		FlushedSeq:        s.flushedSeq,
+		SegmentCount:      len(s.segments),
+		TotalSegmentBytes: totalBytes,
+		PendingGCObjects:  len(s.retiredSegments) * 2,
+		Segments:          append([]SegmentRef(nil), s.segments...),
 	}
 }
 

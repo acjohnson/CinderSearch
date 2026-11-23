@@ -85,6 +85,12 @@ func runServe(args []string) {
 	nvmeDir := fs.String("nvme-dir", "/tmp/cindersearch-nvme", "Local NVMe SSD cache and WAL directory")
 	nvmeMaxMB := fs.Int64("nvme-max-mb", 512, "Max local NVMe read cache size in MB")
 	flushSec := fs.Int("flush-sec", 5, "Background WAL-to-S3 segment flush interval in seconds")
+	mergeIntervalSec := fs.Int("merge-interval-sec", 30, "Background Lucene-style tiered segment merge & S3 GC sweep interval in seconds")
+	mergeMaxSegments := fs.Int("merge-max-segments", 6, "Target max active S3 segments per shard before tiered merging")
+	mergeMaxBytesMB := fs.Int64("merge-max-bytes-mb", 128, "Max merged segment size cap in MB (prevents rewriting large segments)")
+	mergeMaxConcurrent := fs.Int("merge-max-concurrent", 1, "Max concurrent segment merges per data node to protect search p99 latency")
+	mergeReclaimRatio := fs.Float64("merge-reclaim-deletes-ratio", 0.20, "Tombstone/delete ratio threshold (0..1] triggering reclaim merges")
+	s3GCGraceSec := fs.Int("s3-gc-grace-sec", 600, "Grace period in seconds before deleting retired S3 segment objects (> presigned URL TTL)")
 	_ = fs.Parse(args)
 
 	roles, err := sharding.NormalizeRoles(strings.Split(*rolesFlag, ","))
@@ -122,6 +128,11 @@ func runServe(args []string) {
 		log.Fatalf("invalid --peers: %v", err)
 	}
 
+	mergeCfg, err := buildMergeConfig(*mergeIntervalSec, *mergeMaxSegments, *mergeMaxBytesMB, *mergeMaxConcurrent, *mergeReclaimRatio, *s3GCGraceSec)
+	if err != nil {
+		log.Fatalf("invalid merge flags: %v", err)
+	}
+
 	node, err := cluster.NewNode(cluster.NodeConfig{
 		NodeID:           *nodeID,
 		Roles:            roles,
@@ -129,6 +140,7 @@ func runServe(args []string) {
 		NVMeDir:          *nvmeDir,
 		NVMeMaxBytes:     *nvmeMaxMB * 1024 * 1024,
 		FlushInterval:    time.Duration(*flushSec) * time.Second,
+		Merge:            mergeCfg,
 		S3:               s3Client,
 		Peers:            peers,
 	})
@@ -626,4 +638,33 @@ func parsePeersFlag(raw string) ([]sharding.NodeInfo, error) {
 		})
 	}
 	return peers, nil
+}
+
+func buildMergeConfig(intervalSec, maxSegments int, maxBytesMB int64, maxConcurrent int, reclaimRatio float64, gcGraceSec int) (cluster.MergeConfig, error) {
+	if intervalSec < 1 {
+		return cluster.MergeConfig{}, fmt.Errorf("--merge-interval-sec must be >= 1")
+	}
+	if maxSegments < 1 {
+		return cluster.MergeConfig{}, fmt.Errorf("--merge-max-segments must be >= 1")
+	}
+	if maxBytesMB < 1 {
+		return cluster.MergeConfig{}, fmt.Errorf("--merge-max-bytes-mb must be >= 1")
+	}
+	if maxConcurrent < 1 {
+		return cluster.MergeConfig{}, fmt.Errorf("--merge-max-concurrent must be >= 1")
+	}
+	if reclaimRatio <= 0 || reclaimRatio > 1 {
+		return cluster.MergeConfig{}, fmt.Errorf("--merge-reclaim-deletes-ratio must be in (0, 1]")
+	}
+	if gcGraceSec < 1 {
+		return cluster.MergeConfig{}, fmt.Errorf("--s3-gc-grace-sec must be >= 1")
+	}
+	return cluster.MergeConfig{
+		Interval:              time.Duration(intervalSec) * time.Second,
+		MaxSegmentsPerShard:   maxSegments,
+		MaxMergedSegmentBytes: maxBytesMB * 1024 * 1024,
+		MaxConcurrentMerges:   maxConcurrent,
+		ReclaimDeletesRatio:   reclaimRatio,
+		S3GCGrace:             time.Duration(gcGraceSec) * time.Second,
+	}, nil
 }

@@ -74,3 +74,41 @@ func TestRunDemoSmoke(t *testing.T) {
 		t.Fatalf("runDemo smoke test failed: %v", err)
 	}
 }
+
+func TestBuildMergeConfig(t *testing.T) {
+	cfg, err := buildMergeConfig(30, 6, 128, 1, 0.20, 600)
+	if err != nil {
+		t.Fatalf("buildMergeConfig valid defaults: %v", err)
+	}
+	if cfg.Interval != 30*time.Second ||
+		cfg.MaxSegmentsPerShard != 6 ||
+		cfg.MaxMergedSegmentBytes != 128*1024*1024 ||
+		cfg.MaxConcurrentMerges != 1 ||
+		cfg.ReclaimDeletesRatio != 0.20 ||
+		cfg.S3GCGrace != 600*time.Second {
+		t.Fatalf("unexpected merge config: %+v", cfg)
+	}
+
+	badCases := []struct {
+		name          string
+		intervalSec   int
+		maxSegments   int
+		maxBytesMB    int64
+		maxConcurrent int
+		reclaimRatio  float64
+		gcGraceSec    int
+	}{
+		{"zero-interval", 0, 6, 128, 1, 0.20, 600},
+		{"zero-max-segments", 30, 0, 128, 1, 0.20, 600},
+		{"zero-max-bytes", 30, 6, 0, 1, 0.20, 600},
+		{"zero-concurrency", 30, 6, 128, 0, 0.20, 600},
+		{"zero-reclaim-ratio", 30, 6, 128, 1, 0.0, 600},
+		{"ratio-over-one", 30, 6, 128, 1, 1.5, 600},
+		{"zero-gc-grace", 30, 6, 128, 1, 0.20, 0},
+	}
+	for _, tc := range badCases {
+		if _, err := buildMergeConfig(tc.intervalSec, tc.maxSegments, tc.maxBytesMB, tc.maxConcurrent, tc.reclaimRatio, tc.gcGraceSec); err == nil {
+			t.Fatalf("expected error for invalid merge flag case %q", tc.name)
+		}
+	}
+}

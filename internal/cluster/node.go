@@ -59,6 +59,7 @@ type NodeConfig struct {
 	FlushInterval     time.Duration
 	ReplicateInterval time.Duration
 	ScrubInterval     time.Duration
+	Merge             MergeConfig
 	S3                *s3store.Client
 	Peers             []sharding.NodeInfo
 }
@@ -150,11 +151,17 @@ type Node struct {
 	indices map[string]IndexMetadata
 	shards  map[string]map[int]*Shard
 
-	repSuccess atomic.Int64
-	repErrors  atomic.Int64
-	flushes    atomic.Int64
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
+	repSuccess         atomic.Int64
+	repErrors          atomic.Int64
+	flushes            atomic.Int64
+	mergesCompleted    atomic.Int64
+	segmentsMerged     atomic.Int64
+	tombstonesPurged   atomic.Int64
+	versionsCompacted  atomic.Int64
+	s3ObjectsReclaimed atomic.Int64
+	mergeSem           chan struct{}
+	stopCh             chan struct{}
+	wg                 sync.WaitGroup
 }
 
 // NewNode initializes a CinderSearch node, its NVMe cache, cluster ring, and role-appropriate background workers.
@@ -183,6 +190,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.ScrubInterval <= 0 {
 		cfg.ScrubInterval = 5 * time.Second
 	}
+	cfg.Merge = cfg.Merge.Normalize()
 
 	nvmeCache, err := cache.NewNVMeCache(filepath.Join(cfg.NVMeDir, "cache"), cfg.NVMeMaxBytes)
 	if err != nil {
@@ -216,9 +224,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		indices: make(map[string]IndexMetadata),
-		shards:  make(map[string]map[int]*Shard),
-		stopCh:  make(chan struct{}),
+		indices:  make(map[string]IndexMetadata),
+		shards:   make(map[string]map[int]*Shard),
+		mergeSem: make(chan struct{}, cfg.Merge.MaxConcurrentMerges),
+		stopCh:   make(chan struct{}),
 	}
 
 	// Cold-boot recovery: hydrate persisted index metadata, mappings, and aliases from S3.
@@ -227,9 +236,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	if n.HasRole(sharding.RoleData) {
-		n.wg.Add(2)
+		n.wg.Add(3)
 		go n.replicationLoop()
 		go n.flushLoop()
+		go n.mergeLoop()
 	}
 	if n.HasRole(sharding.RoleData) || n.HasRole(sharding.RoleReader) {
 		n.wg.Add(1)
@@ -1572,24 +1582,352 @@ func (n *Node) ExecuteLocalShardSearch(ctx context.Context, sReq ShardSearchRequ
 	return out, nil
 }
 
-// ReplicationStats reports async WAL replication and S3 flush diagnostics.
+// ForceMergeRequest carries a peer RPC request to force-merge local primary shards of an index.
+type ForceMergeRequest struct {
+	IndexName string            `json:"index_name"`
+	Options   ForceMergeOptions `json:"options"`
+}
+
+// ForceMergeSummary aggregates shard-level merge counts across an index or cluster.
+type ForceMergeSummary struct {
+	TotalShards       int `json:"total_shards"`
+	SuccessfulShards  int `json:"successful_shards"`
+	FailedShards      int `json:"failed_shards"`
+	MergesExecuted    int `json:"merges_executed"`
+	SegmentsMerged    int `json:"segments_merged"`
+	TombstonesPurged  int `json:"tombstones_purged"`
+	VersionsCompacted int `json:"versions_compacted"`
+}
+
+// ForceMerge compacts segments across all resolved indices (local and remote primary data nodes).
+func (n *Node) ForceMerge(ctx context.Context, indexPatterns []string, opts ForceMergeOptions) (map[string]any, error) {
+	resolved, err := n.ResolveIndices(indexPatterns)
+	if err != nil {
+		return nil, err
+	}
+
+	var total ForceMergeSummary
+	for _, idxName := range resolved {
+		localSum, err := n.ForceMergeLocal(ctx, idxName, opts)
+		if err != nil {
+			return nil, err
+		}
+		total.TotalShards += localSum.TotalShards
+		total.SuccessfulShards += localSum.SuccessfulShards
+		total.FailedShards += localSum.FailedShards
+		total.MergesExecuted += localSum.MergesExecuted
+		total.SegmentsMerged += localSum.SegmentsMerged
+		total.TombstonesPurged += localSum.TombstonesPurged
+		total.VersionsCompacted += localSum.VersionsCompacted
+
+		for _, peer := range n.ring.DataNodes() {
+			if peer.ID == n.cfg.NodeID || peer.Address == "" {
+				continue
+			}
+			var peerSum ForceMergeSummary
+			if err := n.postJSON(ctx, baseURL(peer.Address)+"/_internal/forcemerge", ForceMergeRequest{
+				IndexName: idxName,
+				Options:   opts,
+			}, &peerSum); err != nil {
+				total.FailedShards++
+				continue
+			}
+			total.TotalShards += peerSum.TotalShards
+			total.SuccessfulShards += peerSum.SuccessfulShards
+			total.FailedShards += peerSum.FailedShards
+			total.MergesExecuted += peerSum.MergesExecuted
+			total.SegmentsMerged += peerSum.SegmentsMerged
+			total.TombstonesPurged += peerSum.TombstonesPurged
+			total.VersionsCompacted += peerSum.VersionsCompacted
+		}
+	}
+
+	return map[string]any{
+		"_shards": map[string]any{
+			"total":      total.TotalShards,
+			"successful": total.SuccessfulShards,
+			"failed":     total.FailedShards,
+		},
+		"merges_executed":    total.MergesExecuted,
+		"segments_merged":    total.SegmentsMerged,
+		"tombstones_purged":  total.TombstonesPurged,
+		"versions_compacted": total.VersionsCompacted,
+	}, nil
+}
+
+// ForceMergeLocal executes ForceMerge on all primary shards of indexName hosted on this node.
+func (n *Node) ForceMergeLocal(ctx context.Context, indexName string, opts ForceMergeOptions) (ForceMergeSummary, error) {
+	n.mu.RLock()
+	shardMap := n.shards[indexName]
+	var primaries []*Shard
+	for _, sh := range shardMap {
+		if sh.isPrimary {
+			primaries = append(primaries, sh)
+		}
+	}
+	n.mu.RUnlock()
+
+	var summary ForceMergeSummary
+	for _, sh := range primaries {
+		summary.TotalShards++
+		select {
+		case n.mergeSem <- struct{}{}:
+		case <-ctx.Done():
+			summary.FailedShards++
+			return summary, ctx.Err()
+		}
+		res, err := sh.ForceMerge(ctx, opts)
+		<-n.mergeSem
+		if err != nil {
+			summary.FailedShards++
+			return summary, err
+		}
+		summary.SuccessfulShards++
+		if res.Merged {
+			n.recordMergeMetrics(res)
+			summary.MergesExecuted++
+			summary.SegmentsMerged += res.InputSegments
+			summary.TombstonesPurged += res.TombstonesPurged
+			summary.VersionsCompacted += res.VersionsCompacted
+		}
+	}
+	return summary, nil
+}
+
+// LocalShardSegments returns ShardStats for local primary shards matching indexName (or all if empty).
+func (n *Node) LocalShardSegments(indexName string) []ShardStats {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	var out []ShardStats
+	for idx, m := range n.shards {
+		if indexName != "" && idx != indexName {
+			continue
+		}
+		for _, sh := range m {
+			if sh.isPrimary {
+				out = append(out, sh.Stats())
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].IndexName == out[j].IndexName {
+			return out[i].ShardID < out[j].ShardID
+		}
+		return out[i].IndexName < out[j].IndexName
+	})
+	return out
+}
+
+// gatherClusterShardSegments collects primary shard segment metadata from this node and remote data peers.
+func (n *Node) gatherClusterShardSegments(ctx context.Context, indexPatterns []string) ([]ShardStats, error) {
+	resolved, err := n.ResolveIndices(indexPatterns)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]struct{}, len(resolved))
+	for _, name := range resolved {
+		allowed[name] = struct{}{}
+	}
+
+	var all []ShardStats
+	for _, st := range n.LocalShardSegments("") {
+		if _, ok := allowed[st.IndexName]; ok {
+			all = append(all, st)
+		}
+	}
+	for _, peer := range n.ring.DataNodes() {
+		if peer.ID == n.cfg.NodeID || peer.Address == "" {
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL(peer.Address)+"/_internal/segments", nil)
+		if err != nil {
+			continue
+		}
+		resp, err := n.httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		var peerStats []ShardStats
+		if resp.StatusCode == http.StatusOK {
+			_ = json.NewDecoder(resp.Body).Decode(&peerStats)
+		}
+		_ = resp.Body.Close()
+		for _, st := range peerStats {
+			if _, ok := allowed[st.IndexName]; ok {
+				all = append(all, st)
+			}
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].IndexName == all[j].IndexName {
+			return all[i].ShardID < all[j].ShardID
+		}
+		return all[i].IndexName < all[j].IndexName
+	})
+	return all, nil
+}
+
+// IndexSegments returns an Elasticsearch-formatted GET /{index}/_segments response.
+func (n *Node) IndexSegments(ctx context.Context, indexPatterns []string) (map[string]any, error) {
+	shards, err := n.gatherClusterShardSegments(ctx, indexPatterns)
+	if err != nil {
+		return nil, err
+	}
+
+	indicesOut := make(map[string]any)
+	for _, st := range shards {
+		idxObj, ok := indicesOut[st.IndexName].(map[string]any)
+		if !ok {
+			idxObj = map[string]any{"shards": map[string]any{}}
+			indicesOut[st.IndexName] = idxObj
+		}
+		shardsMap := idxObj["shards"].(map[string]any)
+		segMap := make(map[string]any, len(st.Segments))
+		for _, seg := range st.Segments {
+			segMap[seg.ID] = map[string]any{
+				"num_docs":       seg.DocCount,
+				"deleted_docs":   seg.DeletedCount,
+				"size_in_bytes":  seg.SizeBytes,
+				"min_seq":        seg.MinSeq,
+				"max_seq":        seg.MaxSeq,
+				"idx_key":        seg.IdxKey,
+				"docs_key":       seg.DocsKey,
+				"committed":      true,
+				"search":         true,
+				"storage_engine": "s3+nvme",
+			}
+		}
+		shardsMap[strconv.Itoa(st.ShardID)] = []map[string]any{{
+			"routing": map[string]any{
+				"state":   "STARTED",
+				"primary": st.IsPrimary,
+			},
+			"num_committed_segments": len(st.Segments),
+			"pending_gc_objects":     st.PendingGCObjects,
+			"segments":               segMap,
+		}}
+	}
+
+	return map[string]any{
+		"_shards": map[string]any{
+			"total":      len(shards),
+			"successful": len(shards),
+			"failed":     0,
+		},
+		"indices": indicesOut,
+	}, nil
+}
+
+// CatSegments returns a tabular Elasticsearch GET /_cat/segments JSON array.
+func (n *Node) CatSegments(ctx context.Context, indexPatterns []string) ([]map[string]any, error) {
+	shards, err := n.gatherClusterShardSegments(ctx, indexPatterns)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0)
+	for _, st := range shards {
+		for _, seg := range st.Segments {
+			out = append(out, map[string]any{
+				"index":        st.IndexName,
+				"shard":        st.ShardID,
+				"prirep":       "p",
+				"segment":      seg.ID,
+				"docs.count":   seg.DocCount,
+				"docs.deleted": seg.DeletedCount,
+				"size.bytes":   seg.SizeBytes,
+				"committed":    true,
+				"searchable":   true,
+			})
+		}
+	}
+	return out, nil
+}
+
+// RunMergeAndGCOnce runs one tiered merge evaluation and S3 GC sweep across local primary shards.
+func (n *Node) RunMergeAndGCOnce(ctx context.Context) (mergesRun int, gcDeleted int) {
+	if !n.HasRole(sharding.RoleData) || n.s3 == nil {
+		return 0, 0
+	}
+	n.mu.RLock()
+	var primaries []*Shard
+	for _, m := range n.shards {
+		for _, sh := range m {
+			if sh.isPrimary {
+				primaries = append(primaries, sh)
+			}
+		}
+	}
+	n.mu.RUnlock()
+
+	for _, sh := range primaries {
+		select {
+		case n.mergeSem <- struct{}{}:
+			res, err := sh.MergeIfNeeded(ctx, n.cfg.Merge)
+			<-n.mergeSem
+			if err == nil && res.Merged {
+				n.recordMergeMetrics(res)
+				mergesRun++
+			}
+		default:
+			// Concurrency gate saturated: skip to avoid competing with active merges.
+		}
+
+		if gcRes, err := sh.SweepRetiredS3Objects(ctx, n.cfg.Merge.S3GCGrace); err == nil && gcRes.ObjectsDeleted > 0 {
+			n.s3ObjectsReclaimed.Add(int64(gcRes.ObjectsDeleted))
+			gcDeleted += gcRes.ObjectsDeleted
+		}
+	}
+	return mergesRun, gcDeleted
+}
+
+func (n *Node) recordMergeMetrics(res MergeResult) {
+	n.mergesCompleted.Add(1)
+	n.segmentsMerged.Add(int64(res.InputSegments))
+	n.tombstonesPurged.Add(int64(res.TombstonesPurged))
+	n.versionsCompacted.Add(int64(res.VersionsCompacted))
+}
+
+func (n *Node) mergeLoop() {
+	defer n.wg.Done()
+	ticker := time.NewTicker(n.cfg.Merge.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-ticker.C:
+			n.RunMergeAndGCOnce(context.Background())
+		}
+	}
+}
+
+// ReplicationStats reports async WAL replication, S3 flush, segment merge, and GC diagnostics.
 type ReplicationStats struct {
 	NodeID                 string       `json:"node_id"`
 	Roles                  []string     `json:"roles"`
 	ReplicationBatchesSent int64        `json:"replication_batches_sent"`
 	ReplicationErrors      int64        `json:"replication_errors"`
 	S3SegmentFlushes       int64        `json:"s3_segment_flushes"`
+	MergesCompleted        int64        `json:"merges_completed"`
+	SegmentsMerged         int64        `json:"segments_merged"`
+	TombstonesPurged       int64        `json:"tombstones_purged"`
+	VersionsCompacted      int64        `json:"versions_compacted"`
+	S3ObjectsReclaimed     int64        `json:"s3_objects_reclaimed"`
+	PendingGCObjects       int          `json:"pending_gc_objects"`
 	NVMeCache              cache.Stats  `json:"nvme_cache"`
 	Shards                 []ShardStats `json:"shards"`
 }
 
-// Stats returns node-level replication, flush, NVMe cache, and shard diagnostics.
+// Stats returns node-level replication, flush, merge, GC, NVMe cache, and shard diagnostics.
 func (n *Node) Stats() ReplicationStats {
 	n.mu.RLock()
 	var shardStats []ShardStats
+	pendingGC := 0
 	for _, m := range n.shards {
 		for _, sh := range m {
-			shardStats = append(shardStats, sh.Stats())
+			st := sh.Stats()
+			pendingGC += st.PendingGCObjects
+			shardStats = append(shardStats, st)
 		}
 	}
 	n.mu.RUnlock()
@@ -1606,6 +1944,12 @@ func (n *Node) Stats() ReplicationStats {
 		ReplicationBatchesSent: n.repSuccess.Load(),
 		ReplicationErrors:      n.repErrors.Load(),
 		S3SegmentFlushes:       n.flushes.Load(),
+		MergesCompleted:        n.mergesCompleted.Load(),
+		SegmentsMerged:         n.segmentsMerged.Load(),
+		TombstonesPurged:       n.tombstonesPurged.Load(),
+		VersionsCompacted:      n.versionsCompacted.Load(),
+		S3ObjectsReclaimed:     n.s3ObjectsReclaimed.Load(),
+		PendingGCObjects:       pendingGC,
 		NVMeCache:              n.nvmeCache.Stats(),
 		Shards:                 shardStats,
 	}

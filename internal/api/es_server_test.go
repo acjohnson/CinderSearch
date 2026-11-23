@@ -725,6 +725,120 @@ func TestESv8CompatHeadersHeadCreateConflictMappingCountAliasesAndWildcards(t *t
 	}
 }
 
+func TestESForceMergeAndSegmentInspectionEndpoints(t *testing.T) {
+	_, srvs, _, _ := newTestCluster(t, 2, 16*1024*1024)
+
+	code, _ := doJSONReq(t, http.MethodPut, srvs[0].URL+"/catalog", `{"settings":{"number_of_shards":2,"number_of_replicas":0}}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("create catalog index failed: %d", code)
+	}
+
+	// Create 3 separate S3 segments across shards with updates & deletes.
+	for round := 1; round <= 3; round++ {
+		for i := 1; i <= 6; i++ {
+			if round == 3 && i == 6 {
+				continue // keep prod-6 deleted so tombstone is purged and live count stays 5
+			}
+			id := fmt.Sprintf("prod-%d", i)
+			body := fmt.Sprintf(`{"sku":%q,"round":%d,"title":"catalog product %d"}`, id, round, i)
+			code, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/catalog/_doc/"+id, body, nil)
+			if code != http.StatusOK {
+				t.Fatalf("put %s round %d failed: %d", id, round, code)
+			}
+		}
+		if round == 2 {
+			code, _ = doJSONReq(t, http.MethodDelete, srvs[0].URL+"/catalog/_doc/prod-6", "", nil)
+			if code != http.StatusOK {
+				t.Fatalf("delete prod-6 failed: %d", code)
+			}
+		}
+		code, _ = doJSONReq(t, http.MethodPost, srvs[0].URL+"/catalog/_refresh?flush=true", "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("flush round %d failed: %d", round, code)
+		}
+	}
+
+	// 1. Inspect pre-merge segments via GET /_cat/segments/catalog and GET /catalog/_segments.
+	catResp, err := http.Get(srvs[1].URL + "/_cat/segments/catalog")
+	if err != nil {
+		t.Fatalf("GET /_cat/segments/catalog: %v", err)
+	}
+	var catBefore []map[string]any
+	_ = json.NewDecoder(catResp.Body).Decode(&catBefore)
+	_ = catResp.Body.Close()
+	if len(catBefore) < 4 {
+		t.Fatalf("expected >= 4 segments across 2 shards before forcemerge, got %d: %+v", len(catBefore), catBefore)
+	}
+
+	code, segsBefore := doJSONReq(t, http.MethodGet, srvs[1].URL+"/catalog/_segments", "", nil)
+	if code != http.StatusOK || segsBefore["indices"] == nil {
+		t.Fatalf("GET /catalog/_segments failed: code=%d body=%+v", code, segsBefore)
+	}
+
+	// 2. Test POST /catalog/_forcemerge?only_expunge_deletes=true via peer node-2.
+	code, expungeRes := doJSONReq(t, http.MethodPost, srvs[1].URL+"/catalog/_forcemerge?only_expunge_deletes=true", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("POST /catalog/_forcemerge?only_expunge_deletes=true failed: code=%d body=%+v", code, expungeRes)
+	}
+	if int(expungeRes["tombstones_purged"].(float64)) < 1 {
+		t.Fatalf("expected >= 1 tombstone purged by only_expunge_deletes, got %+v", expungeRes)
+	}
+
+	// 3. Test cluster-wide POST /_forcemerge?max_num_segments=1.
+	code, fmRes := doJSONReq(t, http.MethodPost, srvs[0].URL+"/_forcemerge?max_num_segments=1", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("POST /_forcemerge?max_num_segments=1 failed: code=%d body=%+v", code, fmRes)
+	}
+	shardsMeta := fmRes["_shards"].(map[string]any)
+	if int(shardsMeta["total"].(float64)) != 2 || int(shardsMeta["successful"].(float64)) != 2 || int(shardsMeta["failed"].(float64)) != 0 {
+		t.Fatalf("unexpected _forcemerge _shards summary: %+v", fmRes)
+	}
+
+	// 4. Verify GET /_cat/segments now reports exactly 1 segment per shard (2 total) and 0 deleted docs.
+	catAfterResp, err := http.Get(srvs[0].URL + "/_cat/segments")
+	if err != nil {
+		t.Fatalf("GET /_cat/segments: %v", err)
+	}
+	var catAfter []map[string]any
+	_ = json.NewDecoder(catAfterResp.Body).Decode(&catAfter)
+	_ = catAfterResp.Body.Close()
+	if len(catAfter) != 2 {
+		t.Fatalf("expected exactly 2 segments (1 per shard) after max_num_segments=1, got %d: %+v", len(catAfter), catAfter)
+	}
+	for _, row := range catAfter {
+		if int(row["docs.deleted"].(float64)) != 0 {
+			t.Fatalf("expected 0 deleted docs after forcemerge, got %+v", row)
+		}
+	}
+
+	// 5. Verify GET /_segments and /_cinder/stats expose compaction metrics & pending GC objects.
+	code, allSegs := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_segments", "", nil)
+	if code != http.StatusOK || allSegs["indices"].(map[string]any)["catalog"] == nil {
+		t.Fatalf("GET /_segments missing catalog: code=%d body=%+v", code, allSegs)
+	}
+
+	var totalMerges, totalPurged, totalPendingGC int
+	for _, srv := range srvs {
+		code, st := doJSONReq(t, http.MethodGet, srv.URL+"/_cinder/stats", "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("GET /_cinder/stats failed: %d", code)
+		}
+		totalMerges += int(st["merges_completed"].(float64))
+		totalPurged += int(st["tombstones_purged"].(float64))
+		totalPendingGC += int(st["pending_gc_objects"].(float64))
+	}
+	if totalMerges < 2 || totalPurged < 1 || totalPendingGC < 4 {
+		t.Fatalf("expected cluster stats merges>=2 purged>=1 pendingGC>=4, got merges=%d purged=%d pendingGC=%d",
+			totalMerges, totalPurged, totalPendingGC)
+	}
+
+	// 6. Confirm live document count is 5 (prod-1..prod-5; prod-6 stays permanently deleted).
+	code, cnt := doJSONReq(t, http.MethodGet, srvs[0].URL+"/catalog/_count", "", nil)
+	if code != http.StatusOK || int(cnt["count"].(float64)) != 5 {
+		t.Fatalf("expected 5 live catalog docs after forcemerge, got code=%d body=%+v", code, cnt)
+	}
+}
+
 func FuzzESBulkNDJSON(f *testing.F) {
 	s3Srv := s3store.NewMockServer("ak-fz", "sk-fz", "us-east-1")
 	defer s3Srv.Close()

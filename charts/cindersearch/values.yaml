@@ -106,6 +106,16 @@ s3:
 engine:
   listenPort: 9200
   flushSec: 5
+  # Lucene-style TieredMergePolicy + crash-safe deferred S3 garbage collection
+  # (tuned for latency-sensitive application & catalog search: low segment fan-out,
+  # strict concurrency=1 pacing, and a 600s GC grace window > 5m presigned URL TTL)
+  merge:
+    intervalSec: 30
+    maxSegmentsPerShard: 6
+    maxMergedSegmentMB: 128
+    maxConcurrent: 1
+    reclaimDeletesRatio: 0.2
+    s3GCGraceSec: 600
   pprof:
     enabled: false
     port: 6060

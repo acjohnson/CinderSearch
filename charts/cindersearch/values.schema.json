@@ -39,7 +39,18 @@
       "type": "object",
       "properties": {
         "listenPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "flushSec": { "type": "integer", "minimum": 1 }
+        "flushSec": { "type": "integer", "minimum": 1 },
+        "merge": {
+          "type": "object",
+          "properties": {
+            "intervalSec": { "type": "integer", "minimum": 1 },
+            "maxSegmentsPerShard": { "type": "integer", "minimum": 1 },
+            "maxMergedSegmentMB": { "type": "integer", "minimum": 1 },
+            "maxConcurrent": { "type": "integer", "minimum": 1 },
+            "reclaimDeletesRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "s3GCGraceSec": { "type": "integer", "minimum": 1 }
+          }
+        }
       }
     },
     "data": {

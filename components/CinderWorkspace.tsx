@@ -71,6 +71,11 @@ const ES_COMPAT_MATRIX = [
     notes: 'Global cross-shard merge with nested sub-aggregations and from/size pagination',
   },
   {
+    surface: 'Segment Merging & S3 GC',
+    endpoints: 'POST /_forcemerge, POST /{index}/_forcemerge (?max_num_segments, ?only_expunge_deletes), GET /{index}/_segments, GET /_cat/segments',
+    notes: 'Lucene-style TieredMergePolicy (cap 128 MiB, concurrency=1), deterministic base-0 tombstone purge, NVMe pre-warm & 10m S3 GC grace window',
+  },
+  {
     surface: 'Zero-Hop S3 Retrieval',
     endpoints: '?retrieval=dropin | presigned | hybrid (or X-Cinder-Retrieval header)',
     notes: 'Drop-in _source by default; opt-in SigV4 Presigned URL + Range: bytes=start-end + CRC32C digest',

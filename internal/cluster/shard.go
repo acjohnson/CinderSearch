@@ -18,6 +18,10 @@ import (
 	"github.com/cindersearch/cindersearch/internal/wal"
 )
 
+// ErrStalePrimaryTerm is returned when a fenced primary attempts to commit to S3
+// after another node has already promoted the shard to a higher primary_term.
+var ErrStalePrimaryTerm = errors.New("stale primary term: shard fenced by newer primary")
+
 // SegmentRef describes an immutable segment persisted on S3 in the shard manifest.
 type SegmentRef struct {
 	ID           string `json:"id"`
@@ -46,6 +50,8 @@ type RetiredSegmentRef struct {
 type ShardManifest struct {
 	IndexName       string              `json:"index_name"`
 	ShardID         int                 `json:"shard_id"`
+	PrimaryTerm     uint64              `json:"primary_term,omitempty"`
+	PrimaryNode     string              `json:"primary_node,omitempty"`
 	FlushedSeq      uint64              `json:"flushed_seq"`
 	NextSegCounter  int                 `json:"next_seg_counter,omitempty"`
 	Segments        []SegmentRef        `json:"segments"`
@@ -55,12 +61,15 @@ type ShardManifest struct {
 // Shard manages one logical shard (primary or replica) backed by an NVMe WAL write buffer,
 // an in-memory NRT segment, an NVMe LRU read cache, and S3 immutable segments.
 type Shard struct {
-	mu        sync.RWMutex
-	flushMu   sync.Mutex
-	indexName string
-	shardID   int
-	isPrimary bool
-	readOnly  bool
+	mu          sync.RWMutex
+	flushMu     sync.Mutex
+	indexName   string
+	shardID     int
+	isPrimary   bool
+	readOnly    bool
+	ownerNodeID string
+	primaryTerm uint64
+	primaryNode string
 
 	wal       *wal.WAL
 	nvmeCache *cache.NVMeCache
@@ -105,6 +114,7 @@ func OpenShard(
 		indexName:     indexName,
 		shardID:       shardID,
 		isPrimary:     isPrimary,
+		primaryTerm:   1,
 		wal:           w,
 		nvmeCache:     nvmeCache,
 		s3:            s3,
@@ -124,6 +134,10 @@ func OpenShard(
 				sh.segments = man.Segments
 				sh.retiredSegments = man.RetiredSegments
 				sh.segCounter = manifestSegCounter(man)
+				if man.PrimaryTerm > 0 {
+					sh.primaryTerm = man.PrimaryTerm
+				}
+				sh.primaryNode = man.PrimaryNode
 				sh.manifestVer = 1
 			}
 		} else if !errors.Is(err, s3store.ErrNotFound) {
@@ -160,6 +174,7 @@ func OpenReadOnlyShard(
 		shardID:       shardID,
 		isPrimary:     false,
 		readOnly:      true,
+		primaryTerm:   1,
 		nvmeCache:     nvmeCache,
 		s3:            s3,
 		memDocs:       make(map[string]wal.Record),
@@ -177,6 +192,10 @@ func OpenReadOnlyShard(
 				sh.segments = man.Segments
 				sh.retiredSegments = man.RetiredSegments
 				sh.segCounter = manifestSegCounter(man)
+				if man.PrimaryTerm > 0 {
+					sh.primaryTerm = man.PrimaryTerm
+				}
+				sh.primaryNode = man.PrimaryNode
 				sh.manifestVer = 1
 			}
 		} else if !errors.Is(err, s3store.ErrNotFound) {
@@ -184,6 +203,164 @@ func OpenReadOnlyShard(
 		}
 	}
 	return sh, nil
+}
+
+// SetOwnerNodeID records the local node ID hosting this shard for primary_term fencing metadata.
+func (s *Shard) SetOwnerNodeID(nodeID string) {
+	s.mu.Lock()
+	s.ownerNodeID = nodeID
+	if s.isPrimary && s.primaryNode == "" {
+		s.primaryNode = nodeID
+	}
+	s.mu.Unlock()
+}
+
+// IsPrimary reports whether this shard instance is currently acting as the primary writer.
+func (s *Shard) IsPrimary() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isPrimary
+}
+
+// PrimaryTerm returns the shard's current monotonic Elasticsearch _primary_term.
+func (s *Shard) PrimaryTerm() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.primaryTerm == 0 {
+		return 1
+	}
+	return s.primaryTerm
+}
+
+// PromoteToPrimary upgrades a replica shard to primary, increments primary_term in S3 manifest.json
+// to fence any isolated former primary, and retains the replicated local WAL tail for zero-gap failover.
+func (s *Shard) PromoteToPrimary(ctx context.Context, nodeID string) (uint64, error) {
+	if s.readOnly || s.wal == nil {
+		return 0, fmt.Errorf("cannot promote read-only shard %s[%d]", s.indexName, s.shardID)
+	}
+
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	s.mu.RLock()
+	if s.isPrimary && (s.primaryNode == nodeID || nodeID == "") {
+		term := s.primaryTerm
+		s.mu.RUnlock()
+		return term, nil
+	}
+	localTerm := s.primaryTerm
+	flushedSeq := s.flushedSeq
+	segments := append([]SegmentRef(nil), s.segments...)
+	retired := append([]RetiredSegmentRef(nil), s.retiredSegments...)
+	segCounter := s.segCounter
+	s.mu.RUnlock()
+
+	if s.s3 != nil {
+		if data, _, err := s.s3.GetObject(ctx, manifestKey(s.indexName, s.shardID)); err == nil {
+			var remote ShardManifest
+			if json.Unmarshal(data, &remote) == nil {
+				if remote.PrimaryTerm > localTerm {
+					localTerm = remote.PrimaryTerm
+				}
+				if remote.FlushedSeq > flushedSeq {
+					flushedSeq = remote.FlushedSeq
+				}
+				if len(remote.Segments) > 0 || len(remote.RetiredSegments) > 0 {
+					segments = remote.Segments
+					retired = remote.RetiredSegments
+				}
+				if c := manifestSegCounter(remote); c > segCounter {
+					segCounter = c
+				}
+			}
+		} else if !errors.Is(err, s3store.ErrNotFound) {
+			return 0, fmt.Errorf("read manifest during promotion: %w", err)
+		}
+	}
+
+	newTerm := localTerm + 1
+	if newTerm < 2 {
+		newTerm = 2
+	}
+
+	if s.s3 != nil {
+		man := ShardManifest{
+			IndexName:       s.indexName,
+			ShardID:         s.shardID,
+			PrimaryTerm:     newTerm,
+			PrimaryNode:     nodeID,
+			FlushedSeq:      flushedSeq,
+			NextSegCounter:  segCounter,
+			Segments:        segments,
+			RetiredSegments: retired,
+		}
+		manBytes, err := json.Marshal(man)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := s.s3.PutObject(ctx, manifestKey(s.indexName, s.shardID), manBytes); err != nil {
+			return 0, fmt.Errorf("commit promoted primary_term=%d: %w", newTerm, err)
+		}
+	}
+
+	s.mu.Lock()
+	s.isPrimary = true
+	s.ownerNodeID = nodeID
+	s.primaryTerm = newTerm
+	s.primaryNode = nodeID
+	s.flushedSeq = flushedSeq
+	s.segments = segments
+	s.retiredSegments = retired
+	s.segCounter = segCounter
+	s.manifestVer++
+	s.replicaAckSeq = make(map[string]uint64)
+	s.mu.Unlock()
+
+	s.segCacheMu.Lock()
+	s.committedLatestSeq = nil
+	s.committedManifestVer = 0
+	s.segCacheMu.Unlock()
+
+	return newTerm, nil
+}
+
+// DemoteToReplica transitions this shard from primary to replica (e.g. during rebalancing or fencing).
+func (s *Shard) DemoteToReplica() {
+	s.mu.Lock()
+	s.isPrimary = false
+	s.mu.Unlock()
+}
+
+// checkPrimaryTermFencing verifies that S3 has not been promoted to a higher primary_term by another node.
+// If fenced, this shard immediately demotes itself and returns ErrStalePrimaryTerm.
+func (s *Shard) checkPrimaryTermFencing(ctx context.Context, localTerm uint64, ownerNodeID string) error {
+	if s.s3 == nil {
+		return nil
+	}
+	data, _, err := s.s3.GetObject(ctx, manifestKey(s.indexName, s.shardID))
+	if err != nil {
+		if errors.Is(err, s3store.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	var remote ShardManifest
+	if err := json.Unmarshal(data, &remote); err != nil {
+		return nil
+	}
+	if remote.PrimaryTerm > localTerm || (remote.PrimaryTerm == localTerm && remote.PrimaryNode != "" && ownerNodeID != "" && remote.PrimaryNode != ownerNodeID) {
+		s.mu.Lock()
+		s.isPrimary = false
+		if remote.PrimaryTerm > s.primaryTerm {
+			s.primaryTerm = remote.PrimaryTerm
+		}
+		if remote.PrimaryNode != "" {
+			s.primaryNode = remote.PrimaryNode
+		}
+		s.mu.Unlock()
+		return fmt.Errorf("%w: local_term=%d remote_term=%d remote_owner=%s", ErrStalePrimaryTerm, localTerm, remote.PrimaryTerm, remote.PrimaryNode)
+	}
+	return nil
 }
 
 // IndexLocal computes CRC32C on the fly, writes to the NVMe WAL for sub-ms durability,
@@ -373,8 +550,16 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	}
 
 	// Build and persist authoritative S3 manifest BEFORE mutating local memDocs or compacting WAL.
-	// If S3 fails here, memDocs and WAL remain intact so the next flush retries safely.
+	// If S3 fails or another primary fenced this shard with a higher primary_term, memDocs and WAL remain intact.
 	s.mu.RLock()
+	localTerm := s.primaryTerm
+	if localTerm == 0 {
+		localTerm = 1
+	}
+	ownerNodeID := s.ownerNodeID
+	if ownerNodeID == "" {
+		ownerNodeID = s.primaryNode
+	}
 	nextFlushedSeq := s.flushedSeq
 	if maxSeq > nextFlushedSeq {
 		nextFlushedSeq = maxSeq
@@ -385,9 +570,15 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 	retiredSnapshot := append([]RetiredSegmentRef(nil), s.retiredSegments...)
 	s.mu.RUnlock()
 
+	if err := s.checkPrimaryTermFencing(ctx, localTerm, ownerNodeID); err != nil {
+		return nil, err
+	}
+
 	man := ShardManifest{
 		IndexName:       s.indexName,
 		ShardID:         s.shardID,
+		PrimaryTerm:     localTerm,
+		PrimaryNode:     ownerNodeID,
 		FlushedSeq:      nextFlushedSeq,
 		NextSegCounter:  nextCounter,
 		Segments:        nextSegments,
@@ -453,6 +644,7 @@ func (s *Shard) FlushToS3(ctx context.Context) (*SegmentRef, error) {
 func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[string]uint64, error) {
 	s.mu.RLock()
 	dirty := s.memDirty
+	isPrimary := s.isPrimary
 	var mem *segment.Segment
 	var refs []SegmentRef
 	var curManifestVer uint64
@@ -465,6 +657,7 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 
 	if dirty {
 		s.mu.Lock()
+		isPrimary = s.isPrimary
 		if s.memDirty {
 			if err := s.rebuildMemSegLocked(); err != nil {
 				s.mu.Unlock()
@@ -478,7 +671,7 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 	}
 
 	// Sync manifest from S3 if we are a replica or stateless reader (handles both flushes and merges).
-	if s.s3 != nil && !s.isPrimary {
+	if s.s3 != nil && !isPrimary {
 		if data, _, err := s.s3.GetObject(ctx, manifestKey(s.indexName, s.shardID)); err == nil {
 			var man ShardManifest
 			if json.Unmarshal(data, &man) == nil && !segmentRefsEqual(man.Segments, refs) {
@@ -488,6 +681,12 @@ func (s *Shard) ActiveSegments(ctx context.Context) ([]*segment.Segment, map[str
 				s.flushedSeq = man.FlushedSeq
 				s.retiredSegments = man.RetiredSegments
 				s.segCounter = manifestSegCounter(man)
+				if man.PrimaryTerm > s.primaryTerm {
+					s.primaryTerm = man.PrimaryTerm
+				}
+				if man.PrimaryNode != "" {
+					s.primaryNode = man.PrimaryNode
+				}
 				s.manifestVer++
 				curManifestVer = s.manifestVer
 				s.mu.Unlock()
@@ -728,6 +927,7 @@ type ShardStats struct {
 	ReadOnly          bool         `json:"read_only,omitempty"`
 	WALLength         int          `json:"wal_buffered_ops"`
 	FlushedSeq        uint64       `json:"flushed_seq"`
+	PrimaryTerm       uint64       `json:"primary_term"`
 	SegmentCount      int          `json:"s3_segments"`
 	TotalSegmentBytes int64        `json:"total_segment_bytes"`
 	PendingGCObjects  int          `json:"pending_gc_objects"`
@@ -746,6 +946,10 @@ func (s *Shard) Stats() ShardStats {
 	for _, seg := range s.segments {
 		totalBytes += seg.SizeBytes
 	}
+	term := s.primaryTerm
+	if term == 0 {
+		term = 1
+	}
 	return ShardStats{
 		IndexName:         s.indexName,
 		ShardID:           s.shardID,
@@ -753,6 +957,7 @@ func (s *Shard) Stats() ShardStats {
 		ReadOnly:          s.readOnly,
 		WALLength:         walLen,
 		FlushedSeq:        s.flushedSeq,
+		PrimaryTerm:       term,
 		SegmentCount:      len(s.segments),
 		TotalSegmentBytes: totalBytes,
 		PendingGCObjects:  len(s.retiredSegments) * 2,

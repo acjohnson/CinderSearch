@@ -546,7 +546,7 @@ func TestConcurrentSearchWriteAndForceMergeRaceSafe(t *testing.T) {
 					}
 				}
 				if i < 4 {
-					if _, _, _, err := coordNode.DeleteDoc(ctx, "catalog", id); err != nil {
+					if _, _, err := coordNode.DeleteDoc(ctx, "catalog", id, ""); err != nil {
 						t.Errorf("delete %s: %v", id, err)
 					}
 				}

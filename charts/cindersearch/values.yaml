@@ -20,6 +20,24 @@ cluster:
   # - single:        Single data node (dev/eval)
   topology: multi-node
   domain: cluster.local
+  # Gossip-free S3-lease dynamic cluster membership & automated primary failover:
+  # - hybrid: Uses S3 leases for live discovery/failover + static --peers bootstrap seeds
+  # - s3:     Pure S3-lease discovery (zero static --peers; seamless scale-out/in)
+  # - static: Legacy static --peers only (disables S3 lease polling)
+  discovery:
+    mode: hybrid
+    heartbeatSec: 5
+    leaseTTLSec: 15
+    syncSec: 5
+  # Gossip-free S3-lease dynamic cluster membership & automated primary failover:
+  # - hybrid: Uses S3 leases for live discovery/failover + static --peers bootstrap seeds
+  # - s3:     Pure S3-lease discovery (zero static --peers; seamless scale-out/in)
+  # - static: Legacy static --peers only (disables S3 lease polling)
+  discovery:
+    mode: hybrid
+    heartbeatSec: 5
+    leaseTTLSec: 15
+    syncSec: 5
 
 serviceAccount:
   create: true
@@ -132,6 +150,12 @@ data:
   nvmeMaxMB: 1024
   nvmeDir: /var/lib/cindersearch
   terminationGracePeriodSeconds: 60
+  drain:
+    # Flushes primary WALs to S3 and removes the node's S3 lease via preStop hook before SIGTERM
+    enabled: true
+  drain:
+    # Flushes primary WALs to S3 and removes the node's S3 lease via preStop hook before SIGTERM
+    enabled: true
 
   persistence:
     enabled: true

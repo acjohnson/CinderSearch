@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cindersearch/cindersearch/internal/cluster"
 	"github.com/cindersearch/cindersearch/internal/sharding"
 )
 
@@ -109,6 +110,41 @@ func TestBuildMergeConfig(t *testing.T) {
 	for _, tc := range badCases {
 		if _, err := buildMergeConfig(tc.intervalSec, tc.maxSegments, tc.maxBytesMB, tc.maxConcurrent, tc.reclaimRatio, tc.gcGraceSec); err == nil {
 			t.Fatalf("expected error for invalid merge flag case %q", tc.name)
+		}
+	}
+}
+
+func TestBuildDiscoveryConfig(t *testing.T) {
+	for _, mode := range []string{cluster.DiscoveryModeHybrid, cluster.DiscoveryModeS3, cluster.DiscoveryModeStatic} {
+		cfg, err := buildDiscoveryConfig(mode, 5, 15, 5)
+		if err != nil {
+			t.Fatalf("buildDiscoveryConfig(%q) failed: %v", mode, err)
+		}
+		if cfg.Mode != mode ||
+			cfg.HeartbeatInterval != 5*time.Second ||
+			cfg.LeaseTTL != 15*time.Second ||
+			cfg.SyncInterval != 5*time.Second {
+			t.Fatalf("unexpected discovery config for %q: %+v", mode, cfg)
+		}
+	}
+
+	badCases := []struct {
+		name         string
+		mode         string
+		heartbeatSec int
+		leaseTTLSec  int
+		syncSec      int
+	}{
+		{"invalid-mode", "gossip", 5, 15, 5},
+		{"zero-heartbeat", "hybrid", 0, 15, 5},
+		{"ttl-too-small", "hybrid", 1, 1, 5},
+		{"ttl-not-greater-than-heartbeat", "s3", 10, 10, 5},
+		{"ttl-less-than-heartbeat", "s3", 10, 5, 5},
+		{"zero-sync", "hybrid", 5, 15, 0},
+	}
+	for _, tc := range badCases {
+		if _, err := buildDiscoveryConfig(tc.mode, tc.heartbeatSec, tc.leaseTTLSec, tc.syncSec); err == nil {
+			t.Fatalf("expected error for invalid discovery flag case %q", tc.name)
 		}
 	}
 }

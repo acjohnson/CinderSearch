@@ -18,7 +18,8 @@
   - `reader`: Stateless S3 + NVMe read-cache search node (no WALs, no shard ownership) for horizontally scaling search QPS; supports `?preference=reader` / `X-Cinder-Preference: reader` routing while still forwarding `_doc` reads to `data` primaries for NRT consistency.
   - Unsupported legacy ES roles (`master`, `ml`, `ingest`, `data_hot`/`warm`/`cold`/`frozen`, `transform`, `remote_cluster_client`) are explicitly rejected—leaderless ring metadata + S3 tiering replace master-only and hot/warm/cold splits.
 - **S3-Persisted Cluster Metadata & Cold-Boot Recovery**: Index settings, mappings, and aliases are persisted to `_cluster/indices/<name>.json` on S3 and automatically hydrated on node startup, enabling full cluster recovery even after total pod/NVMe loss.
-- **Official ES v8 Client Handshake, Aliases & Wildcards**: Emits `X-Elastic-Product: Elasticsearch` and negotiates `application/vnd.elasticsearch+json; compatible-with=8`; supports `HEAD /{index}`, `HEAD /{index}/_doc/{id}`, `PUT /{index}/_create/{id}` / `?op_type=create` (`409 Conflict`), `GET/PUT /{index}/_mapping`, `GET/POST /_count`, atomic `POST /_aliases`, `/{index}/_alias/{name}`, and wildcard/exclusion index resolution (`logs-*,-logs-debug*`, `_all`).
+- **Dynamic S3-Lease Cluster Membership & Automated Primary Failover**: Gossip-free node discovery via S3 heartbeat leases (`_cluster/nodes/<nodeID>.json`, `--discovery-mode=hybrid|s3|static`, `--advertise`, `--heartbeat-sec`, `--lease-ttl-sec`, `--membership-sync-sec`). Surviving replicas automatically promote to primary on lease expiration with monotonic `primary_term` fencing in S3 `manifest.json` (preventing stale partitioned primaries from overwriting S3 state), new data/reader pods discover indices and rebalance straight from S3 without restarting existing nodes, and `POST /_cinder/drain` (plus `SIGINT`/`SIGTERM` and Kubernetes `preStop`) flushes WALs and removes leases for zero-downtime rolling upgrades.
+- **Official ES v8 Client Response Fidelity**: Emits `X-Elastic-Product: Elasticsearch` and negotiates `application/vnd.elasticsearch+json; compatible-with=8`; supports authentic `green`/`yellow`/`red` `GET /_cluster/health[/{index}]` (`?wait_for_status=`, `?timeout=`, `?level=cluster|indices|shards`), `GET /_cluster/state[/{metrics}]`, standardized `_version`/`_seq_no`/`_primary_term`/`result`/`_shards` on document CRUD & `_bulk`, plain-text tabular `/_cat/{nodes,indices,shards,segments}` (`?v`, `?h=`, `?format=text|json`), `HEAD /{index}`, `HEAD /{index}/_doc/{id}`, `PUT /{index}/_create/{id}` (`409 Conflict`), `GET/PUT /{index}/_mapping`, `GET/POST /_count`, atomic `POST /_aliases`, and wildcard/exclusion index resolution (`logs-*,-logs-debug*`, `_all`).
 - **Lucene-Style S3 Segment Merging, Deterministic Tombstone GC & `_forcemerge`**: Background `TieredMergePolicy` tuned for latency-sensitive catalog & application search (`--merge-max-segments=6`, `--merge-max-bytes-mb=128`, `--merge-max-concurrent=1`, `--merge-reclaim-deletes-ratio=0.20`). Merges write directly to S3 with atomic `manifest.json` swap, pre-warm the NVMe cache before exposing new segments (preventing cold-cache cliffs), deterministically purge tombstones at base segment `0` (zero zombie resurrection), and defer S3 deletion of retired segments behind a `--s3-gc-grace-sec=600` grace window (`> 5m` presigned URL TTL). Supports `POST /{index}/_forcemerge`, `GET /{index}/_segments`, and `GET /_cat/segments`.
 - **Bit-Rot Protection**: Every WAL frame, replica stream, NVMe cache entry, S3 segment footer, and `_s3_pointer` carries a Castagnoli `CRC32C` digest. Corrupted NVMe cache entries are quarantined and automatically healed from S3.
 
@@ -74,11 +75,13 @@ Nodes can hold multiple comma-separated roles (e.g., `--roles=data,reader` or `@
 Responses are pretty-printed JSON by default (matching Elasticsearch/OpenSearch); append `?pretty=false` for compact single-line JSON on high-throughput clients.
 
 ```bash
-# Inspect cluster health, node roles, and _cat views
+# Inspect cluster health, state, dynamic membership, and plain-text _cat tables
 curl http://localhost:9200/
-curl http://localhost:9200/_cluster/health
-curl http://localhost:9200/_nodes
-curl http://localhost:9200/_cat/nodes
+curl 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s&level=indices'
+curl http://localhost:9200/_cluster/state/nodes,routing_table
+curl 'http://localhost:9200/_cat/nodes?v'
+curl 'http://localhost:9200/_cat/shards?v'
+curl http://localhost:9200/_cinder/membership
 
 # Create an index with 3 shards and 1 replica
 curl -X PUT http://localhost:9200/logs -H 'Content-Type: application/json' -d '{

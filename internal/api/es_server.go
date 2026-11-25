@@ -61,8 +61,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Cluster-wide routes
 	switch {
-	case path == "/_cluster/health" && r.Method == http.MethodGet:
-		s.handleClusterHealth(w, r)
+	case (path == "/_cluster/health" || strings.HasPrefix(path, "/_cluster/health/")) && r.Method == http.MethodGet:
+		var patterns []string
+		if strings.HasPrefix(path, "/_cluster/health/") {
+			raw := strings.TrimPrefix(path, "/_cluster/health/")
+			if raw != "" {
+				patterns = strings.Split(raw, ",")
+			}
+		}
+		s.handleClusterHealth(w, r, patterns)
+		return
+	case (path == "/_cluster/state" || strings.HasPrefix(path, "/_cluster/state/")) && r.Method == http.MethodGet:
+		var metrics []string
+		if strings.HasPrefix(path, "/_cluster/state/") {
+			rest := strings.TrimPrefix(path, "/_cluster/state/")
+			if rest != "" {
+				firstSeg := strings.SplitN(rest, "/", 2)[0]
+				if firstSeg != "" {
+					metrics = strings.Split(firstSeg, ",")
+				}
+			}
+		}
+		s.handleClusterState(w, r, metrics)
 		return
 	case path == "/_nodes" && r.Method == http.MethodGet:
 		s.handleNodes(w, r)
@@ -91,6 +111,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case path == "/_cinder/stats" && r.Method == http.MethodGet:
 		s.writeJSON(w, r, http.StatusOK, s.node.Stats())
+		return
+	case path == "/_cinder/membership" && r.Method == http.MethodGet:
+		s.writeJSON(w, r, http.StatusOK, s.node.MembershipSnapshot(r.Context()))
+		return
+	case path == "/_cinder/drain" && r.Method == http.MethodPost:
+		res, err := s.node.Drain(r.Context())
+		if err != nil {
+			s.writeESError(w, r, http.StatusInternalServerError, "drain_exception", err.Error())
+			return
+		}
+		s.writeJSON(w, r, http.StatusOK, res)
 		return
 	case path == "/_bulk" && (r.Method == http.MethodPost || r.Method == http.MethodPut):
 		s.handleBulk(w, r, "")
@@ -298,24 +329,49 @@ func (s *Server) handleInternal(w http.ResponseWriter, r *http.Request, path str
 	}
 }
 
-func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
-	nodes := s.node.Ring().Nodes()
-	dataNodes := s.node.Ring().DataNodes()
-	indices := s.node.ListIndices()
-	activeShards := 0
-	for _, idx := range indices {
-		activeShards += idx.Settings.NumberOfShards * (1 + idx.Settings.NumberOfReplicas)
+func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request, indexPatterns []string) {
+	q := r.URL.Query()
+	level := strings.ToLower(strings.TrimSpace(q.Get("level")))
+	if level != "" && level != "cluster" && level != "indices" && level != "shards" {
+		s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "invalid level ["+level+"]")
+		return
 	}
-	s.writeJSON(w, r, http.StatusOK, map[string]any{
-		"cluster_name":         "cindersearch-cluster",
-		"status":               "green",
-		"number_of_nodes":      len(nodes),
-		"number_of_data_nodes": len(dataNodes),
-		"active_shards":        activeShards,
-		"number_of_indices":    len(indices),
-		"storage_backend":      "s3+nvme",
-		"checksum_algorithm":   "crc32c",
-	})
+	waitForStatus := strings.TrimSpace(q.Get("wait_for_status"))
+	timeout := 30 * time.Second
+	if rawTimeout := strings.TrimSpace(q.Get("timeout")); rawTimeout != "" {
+		d, err := parseESDuration(rawTimeout)
+		if err != nil || d < 0 {
+			s.writeESError(w, r, http.StatusBadRequest, "illegal_argument_exception", "invalid timeout ["+rawTimeout+"]")
+			return
+		}
+		timeout = d
+	}
+
+	resp, err := s.node.WaitForClusterHealth(r.Context(), indexPatterns, level, waitForStatus, timeout)
+	if err != nil {
+		status := http.StatusInternalServerError
+		errType := "cluster_health_exception"
+		switch {
+		case strings.Contains(err.Error(), "index_not_found_exception"):
+			status = http.StatusNotFound
+			errType = "index_not_found_exception"
+		case strings.Contains(err.Error(), "illegal_argument_exception"):
+			status = http.StatusBadRequest
+			errType = "illegal_argument_exception"
+		}
+		s.writeESError(w, r, status, errType, err.Error())
+		return
+	}
+
+	httpStatus := http.StatusOK
+	if timedOut, ok := resp["timed_out"].(bool); ok && timedOut {
+		httpStatus = http.StatusRequestTimeout
+	}
+	s.writeJSON(w, r, httpStatus, resp)
+}
+
+func (s *Server) handleClusterState(w http.ResponseWriter, r *http.Request, metrics []string) {
+	s.writeJSON(w, r, http.StatusOK, s.node.ClusterState(metrics))
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
@@ -356,30 +412,55 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 			"node.role": short.String(),
 		})
 	}
-	s.writeJSON(w, r, http.StatusOK, out)
+	s.writeCat(w, r, out, []string{"name", "address", "node.role", "roles"})
 }
 
 func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 	indices := s.node.ListIndices()
+	dataCount := len(s.node.Ring().DataNodes())
 	out := make([]map[string]any, 0, len(indices))
 	for _, idx := range indices {
+		health := "green"
+		if dataCount == 0 {
+			health = "red"
+		} else if idx.Settings.NumberOfReplicas > dataCount-1 {
+			health = "yellow"
+		}
 		out = append(out, map[string]any{
-			"health": "green",
+			"health": health,
 			"status": "open",
 			"index":  idx.Name,
 			"pri":    idx.Settings.NumberOfShards,
 			"rep":    idx.Settings.NumberOfReplicas,
 		})
 	}
-	s.writeJSON(w, r, http.StatusOK, out)
+	s.writeCat(w, r, out, []string{"health", "status", "index", "pri", "rep"})
 }
 
 func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 	indices := s.node.ListIndices()
-	var out []map[string]any
+	out := make([]map[string]any, 0)
 	for _, idx := range indices {
 		placements, err := s.node.Ring().AllPlacements(idx.Name, idx.Settings.NumberOfShards, idx.Settings.NumberOfReplicas)
 		if err != nil {
+			for sid := 0; sid < idx.Settings.NumberOfShards; sid++ {
+				out = append(out, map[string]any{
+					"index":  idx.Name,
+					"shard":  sid,
+					"prirep": "p",
+					"state":  "UNASSIGNED",
+					"node":   "",
+				})
+				for u := 0; u < idx.Settings.NumberOfReplicas; u++ {
+					out = append(out, map[string]any{
+						"index":  idx.Name,
+						"shard":  sid,
+						"prirep": "r",
+						"state":  "UNASSIGNED",
+						"node":   "",
+					})
+				}
+			}
 			continue
 		}
 		for _, p := range placements {
@@ -399,9 +480,18 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 					"node":   rep.ID,
 				})
 			}
+			for u := len(p.Replicas); u < idx.Settings.NumberOfReplicas; u++ {
+				out = append(out, map[string]any{
+					"index":  idx.Name,
+					"shard":  p.ShardID,
+					"prirep": "r",
+					"state":  "UNASSIGNED",
+					"node":   "",
+				})
+			}
 		}
 	}
-	s.writeJSON(w, r, http.StatusOK, out)
+	s.writeCat(w, r, out, []string{"index", "shard", "prirep", "state", "node"})
 }
 
 func (s *Server) handleForceMerge(w http.ResponseWriter, r *http.Request, indexPatterns []string) {
@@ -454,7 +544,7 @@ func (s *Server) handleCatSegments(w http.ResponseWriter, r *http.Request, index
 		s.writeESError(w, r, status, "segments_exception", err.Error())
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, res)
+	s.writeCat(w, r, res, []string{"index", "shard", "prirep", "segment", "docs.count", "docs.deleted", "size.bytes", "committed", "searchable"})
 }
 
 func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, indexName string) {
@@ -689,7 +779,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			s.writeESError(w, r, http.StatusBadRequest, "mapper_parsing_exception", reason)
 			return
 		}
-		assignedID, shardID, crc, seq, err := s.node.IndexDocWithOpType(r.Context(), indexName, docID, raw, routing, opType)
+		res, err := s.node.IndexDocMeta(r.Context(), indexName, docID, raw, routing, opType)
 		if err != nil {
 			if errors.Is(err, cluster.ErrVersionConflict) {
 				s.writeESError(w, r, http.StatusConflict, "version_conflict_engine_exception", err.Error())
@@ -699,18 +789,27 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			return
 		}
 		status := http.StatusCreated
-		result := "created"
 		if docID != "" && !strings.EqualFold(opType, "create") {
 			status = http.StatusOK
-			result = "updated"
+		}
+		result := "updated"
+		if res.Created {
+			result = "created"
 		}
 		s.writeJSON(w, r, status, map[string]any{
-			"_index":  indexName,
-			"_id":     assignedID,
-			"_shard":  shardID,
-			"_seq_no": seq,
-			"_crc32c": crc,
-			"result":  result,
+			"_index":        indexName,
+			"_id":           res.ID,
+			"_version":      res.Version,
+			"_shard":        res.ShardID,
+			"_seq_no":       res.SeqNo,
+			"_primary_term": res.PrimaryTerm,
+			"_crc32c":       res.CRC32C,
+			"result":        result,
+			"_shards": map[string]any{
+				"total":      res.ShardsTotal,
+				"successful": res.ShardsSucc,
+				"failed":     0,
+			},
 		})
 
 	case http.MethodGet:
@@ -718,12 +817,12 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required")
 			return
 		}
-		raw, found, crc, ptr, err := s.node.GetDoc(r.Context(), indexName, docID, routing)
+		res, err := s.node.GetDocMeta(r.Context(), indexName, docID, routing)
 		if err != nil {
 			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
 			return
 		}
-		if !found {
+		if !res.Found {
 			s.writeJSON(w, r, http.StatusNotFound, map[string]any{
 				"_index": indexName,
 				"_id":    docID,
@@ -732,14 +831,17 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			return
 		}
 		resp := map[string]any{
-			"_index":  indexName,
-			"_id":     docID,
-			"found":   true,
-			"_crc32c": checksum.FormatHex(crc),
-			"_source": json.RawMessage(raw),
+			"_index":        indexName,
+			"_id":           docID,
+			"_version":      res.Version,
+			"_seq_no":       res.SeqNo,
+			"_primary_term": res.PrimaryTerm,
+			"found":         true,
+			"_crc32c":       checksum.FormatHex(res.CRC32C),
+			"_source":       json.RawMessage(res.Source),
 		}
-		if ptr != nil {
-			resp["_s3_pointer"] = ptr
+		if res.S3Pointer != nil {
+			resp["_s3_pointer"] = res.S3Pointer
 		}
 		s.writeJSON(w, r, http.StatusOK, resp)
 
@@ -748,17 +850,24 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, indexName, do
 			s.writeESError(w, r, http.StatusBadRequest, "action_request_validation_exception", "document id required")
 			return
 		}
-		shardID, seq, err := s.node.DeleteDoc(r.Context(), indexName, docID, routing)
+		res, err := s.node.DeleteDocMeta(r.Context(), indexName, docID, routing)
 		if err != nil {
 			s.writeESError(w, r, http.StatusNotFound, "index_not_found_exception", err.Error())
 			return
 		}
 		s.writeJSON(w, r, http.StatusOK, map[string]any{
-			"_index":  indexName,
-			"_id":     docID,
-			"_shard":  shardID,
-			"_seq_no": seq,
-			"result":  "deleted",
+			"_index":        indexName,
+			"_id":           docID,
+			"_version":      res.Version,
+			"_shard":        res.ShardID,
+			"_seq_no":       res.SeqNo,
+			"_primary_term": res.PrimaryTerm,
+			"result":        "deleted",
+			"_shards": map[string]any{
+				"total":      res.ShardsTotal,
+				"successful": res.ShardsSucc,
+				"failed":     0,
+			},
 		})
 	default:
 		s.writeESError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method)
@@ -786,18 +895,25 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request, indexNa
 		s.writeESError(w, r, http.StatusInternalServerError, "json_marshal_exception", err.Error())
 		return
 	}
-	assignedID, shardID, crc, seq, err := s.node.IndexDoc(r.Context(), indexName, docID, merged, routing)
+	res, err := s.node.IndexDocMeta(r.Context(), indexName, docID, merged, routing, "")
 	if err != nil {
 		s.writeESError(w, r, http.StatusInternalServerError, "update_failed_exception", err.Error())
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{
-		"_index":  indexName,
-		"_id":     assignedID,
-		"_shard":  shardID,
-		"_seq_no": seq,
-		"_crc32c": crc,
-		"result":  "updated",
+		"_index":        indexName,
+		"_id":           res.ID,
+		"_version":      res.Version,
+		"_shard":        res.ShardID,
+		"_seq_no":       res.SeqNo,
+		"_primary_term": res.PrimaryTerm,
+		"_crc32c":       res.CRC32C,
+		"result":        "updated",
+		"_shards": map[string]any{
+			"total":      res.ShardsTotal,
+			"successful": res.ShardsSucc,
+			"failed":     0,
+		},
 	})
 }
 
@@ -836,11 +952,24 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 
 			switch opName {
 			case "delete":
-				_, seq, err := s.node.DeleteDoc(r.Context(), idxName, docID, routing)
-				entry := map[string]any{"_index": idxName, "_id": docID, "_seq_no": seq, "status": 200, "result": "deleted"}
+				res, err := s.node.DeleteDocMeta(r.Context(), idxName, docID, routing)
+				entry := map[string]any{
+					"_index":        idxName,
+					"_id":           docID,
+					"_version":      res.Version,
+					"_seq_no":       res.SeqNo,
+					"_primary_term": res.PrimaryTerm,
+					"_shards": map[string]any{
+						"total":      res.ShardsTotal,
+						"successful": res.ShardsSucc,
+						"failed":     0,
+					},
+					"status": http.StatusOK,
+					"result": "deleted",
+				}
 				if err != nil {
 					hasErrors = true
-					entry["status"] = 404
+					entry["status"] = http.StatusNotFound
 					entry["error"] = err.Error()
 				}
 				items = append(items, map[string]any{"delete": entry})
@@ -890,14 +1019,27 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 				if opName == "create" {
 					opType = "create"
 				}
-				id, _, crc, seq, err := s.node.IndexDocWithOpType(r.Context(), idxName, docID, docBytes, routing, opType)
+				res, err := s.node.IndexDocMeta(r.Context(), idxName, docID, docBytes, routing, opType)
+				itemStatus := http.StatusCreated
+				itemResult := "created"
+				if opName == "update" || !res.Created {
+					itemStatus = http.StatusOK
+					itemResult = "updated"
+				}
 				entry := map[string]any{
-					"_index":  idxName,
-					"_id":     id,
-					"_seq_no": seq,
-					"_crc32c": checksum.FormatHex(crc),
-					"status":  201,
-					"result":  "created",
+					"_index":        idxName,
+					"_id":           res.ID,
+					"_version":      res.Version,
+					"_seq_no":       res.SeqNo,
+					"_primary_term": res.PrimaryTerm,
+					"_crc32c":       checksum.FormatHex(res.CRC32C),
+					"_shards": map[string]any{
+						"total":      res.ShardsTotal,
+						"successful": res.ShardsSucc,
+						"failed":     0,
+					},
+					"status": itemStatus,
+					"result": itemResult,
 				}
 				if err != nil {
 					hasErrors = true
@@ -909,7 +1051,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, defaultIndex
 							"reason": err.Error(),
 						}
 					} else {
-						entry["status"] = 500
+						entry["status"] = http.StatusInternalServerError
 						entry["error"] = err.Error()
 					}
 				}
@@ -1008,6 +1150,222 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request, indexNames 
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+func (s *Server) writeCat(w http.ResponseWriter, r *http.Request, rows []map[string]any, defaultCols []string) {
+	q := r.URL.Query()
+	format := strings.ToLower(strings.TrimSpace(q.Get("format")))
+	accept := strings.ToLower(r.Header.Get("Accept"))
+	hasV := q.Has("v") && !strings.EqualFold(q.Get("v"), "false")
+	wantText := format == "text" || format == "txt" || (format == "" && (hasV || strings.Contains(accept, "text/plain")))
+
+	if !wantText {
+		s.writeJSON(w, r, http.StatusOK, rows)
+		return
+	}
+
+	cols := defaultCols
+	if rawH := strings.TrimSpace(q.Get("h")); rawH != "" {
+		custom := make([]string, 0)
+		for _, c := range strings.Split(rawH, ",") {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				custom = append(custom, c)
+			}
+		}
+		if len(custom) > 0 {
+			cols = custom
+		}
+	}
+
+	widths := make([]int, len(cols))
+	if hasV {
+		for i, c := range cols {
+			widths[i] = len(c)
+		}
+	}
+
+	grid := make([][]string, len(rows))
+	for ri, row := range rows {
+		line := make([]string, len(cols))
+		for ci, col := range cols {
+			val := formatCatCell(row[col])
+			line[ci] = val
+			if len(val) > widths[ci] {
+				widths[ci] = len(val)
+			}
+		}
+		grid[ri] = line
+	}
+
+	var buf strings.Builder
+	writeRow := func(cells []string) {
+		for i, cell := range cells {
+			if i > 0 {
+				buf.WriteString("  ")
+			}
+			buf.WriteString(cell)
+			if i < len(cells)-1 && len(cell) < widths[i] {
+				buf.WriteString(strings.Repeat(" ", widths[i]-len(cell)))
+			}
+		}
+		buf.WriteByte('\n')
+	}
+
+	if hasV {
+		writeRow(cols)
+	}
+	for _, line := range grid {
+		writeRow(line)
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(buf.String()))
+}
+
+func formatCatCell(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case []string:
+		return strings.Join(x, ",")
+	case []any:
+		parts := make([]string, len(x))
+		for i, item := range x {
+			parts[i] = fmt.Sprint(item)
+		}
+		return strings.Join(parts, ",")
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func parseESDuration(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if d, err := time.ParseDuration(raw); err == nil {
+		return d, nil
+	}
+	if strings.HasSuffix(raw, "d") {
+		days, err := strconv.ParseFloat(strings.TrimSuffix(raw, "d"), 64)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(days * float64(24*time.Hour)), nil
+	}
+	if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return time.Duration(ms) * time.Millisecond, nil
+	}
+	return 0, fmt.Errorf("invalid duration %q", raw)
+}
+
+func (s *Server) writeCat(w http.ResponseWriter, r *http.Request, rows []map[string]any, defaultCols []string) {
+	q := r.URL.Query()
+	format := strings.ToLower(strings.TrimSpace(q.Get("format")))
+	accept := strings.ToLower(r.Header.Get("Accept"))
+	hasV := q.Has("v") && !strings.EqualFold(q.Get("v"), "false")
+	wantText := format == "text" || format == "txt" || (format == "" && (hasV || strings.Contains(accept, "text/plain")))
+
+	if !wantText {
+		s.writeJSON(w, r, http.StatusOK, rows)
+		return
+	}
+
+	cols := defaultCols
+	if rawH := strings.TrimSpace(q.Get("h")); rawH != "" {
+		custom := make([]string, 0)
+		for _, c := range strings.Split(rawH, ",") {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				custom = append(custom, c)
+			}
+		}
+		if len(custom) > 0 {
+			cols = custom
+		}
+	}
+
+	widths := make([]int, len(cols))
+	if hasV {
+		for i, c := range cols {
+			widths[i] = len(c)
+		}
+	}
+
+	grid := make([][]string, len(rows))
+	for ri, row := range rows {
+		line := make([]string, len(cols))
+		for ci, col := range cols {
+			val := formatCatCell(row[col])
+			line[ci] = val
+			if len(val) > widths[ci] {
+				widths[ci] = len(val)
+			}
+		}
+		grid[ri] = line
+	}
+
+	var buf strings.Builder
+	writeRow := func(cells []string) {
+		for i, cell := range cells {
+			if i > 0 {
+				buf.WriteString("  ")
+			}
+			buf.WriteString(cell)
+			if i < len(cells)-1 && len(cell) < widths[i] {
+				buf.WriteString(strings.Repeat(" ", widths[i]-len(cell)))
+			}
+		}
+		buf.WriteByte('\n')
+	}
+
+	if hasV {
+		writeRow(cols)
+	}
+	for _, line := range grid {
+		writeRow(line)
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(buf.String()))
+}
+
+func formatCatCell(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case []string:
+		return strings.Join(x, ",")
+	case []any:
+		parts := make([]string, len(x))
+		for i, item := range x {
+			parts[i] = fmt.Sprint(item)
+		}
+		return strings.Join(parts, ",")
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func parseESDuration(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if d, err := time.ParseDuration(raw); err == nil {
+		return d, nil
+	}
+	if strings.HasSuffix(raw, "d") {
+		days, err := strconv.ParseFloat(strings.TrimSuffix(raw, "d"), 64)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(days * float64(24*time.Hour)), nil
+	}
+	if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return time.Duration(ms) * time.Millisecond, nil
+	}
+	return 0, fmt.Errorf("invalid duration %q", raw)
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, r *http.Request, status int, payload any) {

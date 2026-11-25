@@ -60,8 +60,33 @@ type NodeConfig struct {
 	ReplicateInterval time.Duration
 	ScrubInterval     time.Duration
 	Merge             MergeConfig
+	Discovery         DiscoveryConfig
 	S3                *s3store.Client
 	Peers             []sharding.NodeInfo
+}
+
+// DocWriteResult carries official Elasticsearch v8 document write metadata.
+type DocWriteResult struct {
+	ID          string `json:"_id"`
+	ShardID     int    `json:"_shard"`
+	CRC32C      uint32 `json:"_crc32c"`
+	SeqNo       uint64 `json:"_seq_no"`
+	PrimaryTerm uint64 `json:"_primary_term"`
+	Version     uint64 `json:"_version"`
+	Created     bool   `json:"created"`
+	ShardsTotal int    `json:"shards_total"`
+	ShardsSucc  int    `json:"shards_successful"`
+}
+
+// DocGetResult carries official Elasticsearch v8 GET /{index}/_doc/{id} metadata.
+type DocGetResult struct {
+	Found       bool
+	Source      []byte
+	CRC32C      uint32
+	SeqNo       uint64
+	PrimaryTerm uint64
+	Version     uint64
+	S3Pointer   *S3Pointer
 }
 
 // IndexSettings mirrors Elasticsearch index creation settings.
@@ -147,21 +172,28 @@ type Node struct {
 	s3         *s3store.Client
 	httpClient *http.Client
 
-	mu      sync.RWMutex
-	indices map[string]IndexMetadata
-	shards  map[string]map[int]*Shard
+	mu            sync.RWMutex
+	reconcileMu   sync.Mutex
+	advertiseAddr string
+	startedAt     int64
+	indices       map[string]IndexMetadata
+	shards        map[string]map[int]*Shard
 
-	repSuccess         atomic.Int64
-	repErrors          atomic.Int64
-	flushes            atomic.Int64
-	mergesCompleted    atomic.Int64
-	segmentsMerged     atomic.Int64
-	tombstonesPurged   atomic.Int64
-	versionsCompacted  atomic.Int64
-	s3ObjectsReclaimed atomic.Int64
-	mergeSem           chan struct{}
-	stopCh             chan struct{}
-	wg                 sync.WaitGroup
+	repSuccess          atomic.Int64
+	repErrors           atomic.Int64
+	flushes             atomic.Int64
+	mergesCompleted     atomic.Int64
+	segmentsMerged      atomic.Int64
+	tombstonesPurged    atomic.Int64
+	versionsCompacted   atomic.Int64
+	s3ObjectsReclaimed  atomic.Int64
+	promotionsCompleted atomic.Int64
+	draining            atomic.Bool
+	leaseEpoch          atomic.Uint64
+	membershipVer       atomic.Uint64
+	mergeSem            chan struct{}
+	stopCh              chan struct{}
+	wg                  sync.WaitGroup
 }
 
 // NewNode initializes a CinderSearch node, its NVMe cache, cluster ring, and role-appropriate background workers.
@@ -191,6 +223,11 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		cfg.ScrubInterval = 5 * time.Second
 	}
 	cfg.Merge = cfg.Merge.Normalize()
+	discCfg, err := cfg.Discovery.Normalize(strings.TrimSpace(cfg.AdvertiseAddress) != "")
+	if err != nil {
+		return nil, err
+	}
+	cfg.Discovery = discCfg
 
 	nvmeCache, err := cache.NewNVMeCache(filepath.Join(cfg.NVMeDir, "cache"), cfg.NVMeMaxBytes)
 	if err != nil {
@@ -217,10 +254,12 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:       cfg,
-		ring:      sharding.NewRing(64, peers...),
-		nvmeCache: nvmeCache,
-		s3:        cfg.S3,
+		cfg:           cfg,
+		ring:          sharding.NewRing(64, peers...),
+		nvmeCache:     nvmeCache,
+		s3:            cfg.S3,
+		advertiseAddr: strings.TrimSpace(cfg.AdvertiseAddress),
+		startedAt:     time.Now().UTC().UnixMilli(),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -230,8 +269,11 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		stopCh:   make(chan struct{}),
 	}
 
-	// Cold-boot recovery: hydrate persisted index metadata, mappings, and aliases from S3.
-	if n.s3 != nil && len(n.ring.DataNodes()) > 0 {
+	if n.discoveryEnabled() {
+		_ = n.PublishLease(context.Background())
+		_, _ = n.SyncMembershipOnce(context.Background())
+	} else if n.s3 != nil && len(n.ring.DataNodes()) > 0 {
+		// Cold-boot recovery for static-peer mode: hydrate persisted index metadata, mappings, and aliases from S3.
 		_ = n.LoadClusterMetadataFromS3(context.Background())
 	}
 
@@ -244,6 +286,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if n.HasRole(sharding.RoleData) || n.HasRole(sharding.RoleReader) {
 		n.wg.Add(1)
 		go n.scrubLoop()
+	}
+	if n.discoveryEnabled() {
+		n.wg.Add(1)
+		go n.membershipLoop()
 	}
 
 	return n, nil
@@ -287,12 +333,30 @@ func (n *Node) S3() *s3store.Client {
 // UpdatePeers updates the consistent hash ring membership.
 func (n *Node) UpdatePeers(peers []sharding.NodeInfo) {
 	for _, p := range peers {
+		if p.ID == n.cfg.NodeID && p.Address != "" {
+			n.SetAdvertiseAddress(p.Address)
+		}
 		n.ring.AddNode(p)
 	}
 }
 
-// Close stops background workers and closes open shard WALs.
+// Close gracefully removes the node's S3 lease, stops background workers, and closes open shard WALs.
 func (n *Node) Close() error {
+	if n.discoveryEnabled() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = n.DeleteLease(ctx)
+		cancel()
+	}
+	return n.stopAndCloseLocal()
+}
+
+// SimulateCrash stops background workers and closes local WAL handles without deleting the node's
+// S3 membership lease, enabling deterministic tests of lease-TTL expiration and primary failover.
+func (n *Node) SimulateCrash() error {
+	return n.stopAndCloseLocal()
+}
+
+func (n *Node) stopAndCloseLocal() error {
 	close(n.stopCh)
 	n.wg.Wait()
 
@@ -434,6 +498,7 @@ func (n *Node) ApplyIndexMetadata(ctx context.Context, meta IndexMetadata) error
 			if err != nil {
 				return err
 			}
+			sh.SetOwnerNodeID(n.cfg.NodeID)
 			n.mu.Lock()
 			n.shards[meta.Name][p.ShardID] = sh
 			n.mu.Unlock()
@@ -856,14 +921,29 @@ func (n *Node) EnsureIndex(ctx context.Context, indexName string) (IndexMetadata
 // IndexDoc routes a document write to its primary shard node (local or remote),
 // computes CRC32C, writes to NVMe WAL, and returns immediately while async replication runs.
 func (n *Node) IndexDoc(ctx context.Context, indexName, docID string, rawJSON []byte, routing string) (string, int, uint32, uint64, error) {
-	return n.IndexDocWithOpType(ctx, indexName, docID, rawJSON, routing, "")
+	res, err := n.IndexDocMeta(ctx, indexName, docID, rawJSON, routing, "")
+	if err != nil {
+		return "", res.ShardID, 0, 0, err
+	}
+	return res.ID, res.ShardID, res.CRC32C, res.SeqNo, nil
 }
 
 // IndexDocWithOpType supports Elasticsearch op_type=create (returning ErrVersionConflict if docID already exists).
 func (n *Node) IndexDocWithOpType(ctx context.Context, indexName, docID string, rawJSON []byte, routing, opType string) (string, int, uint32, uint64, error) {
+	res, err := n.IndexDocMeta(ctx, indexName, docID, rawJSON, routing, opType)
+	if err != nil {
+		return "", res.ShardID, 0, 0, err
+	}
+	return res.ID, res.ShardID, res.CRC32C, res.SeqNo, nil
+}
+
+// IndexDocMeta routes a document write and returns full Elasticsearch v8 write metadata
+// (_id, _seq_no, _primary_term, _version, created/updated, and _shards counts), with
+// automatic single failover retry if a remote primary became unreachable after promotion.
+func (n *Node) IndexDocMeta(ctx context.Context, indexName, docID string, rawJSON []byte, routing, opType string) (DocWriteResult, error) {
 	meta, err := n.EnsureIndex(ctx, indexName)
 	if err != nil {
-		return "", 0, 0, 0, err
+		return DocWriteResult{}, err
 	}
 	if docID == "" {
 		docID = generateDocID()
@@ -873,100 +953,200 @@ func (n *Node) IndexDocWithOpType(ctx context.Context, indexName, docID string, 
 	}
 
 	shardID := sharding.ShardForKey(indexName, routing, meta.Settings.NumberOfShards)
-	placement, err := n.ring.PlacementForShard(indexName, shardID, meta.Settings.NumberOfReplicas)
-	if err != nil {
-		return "", 0, 0, 0, err
-	}
 
-	if placement.Primary.ID == n.cfg.NodeID {
-		n.mu.RLock()
-		sh := n.shards[indexName][shardID]
-		n.mu.RUnlock()
-		if sh == nil {
-			return "", 0, 0, 0, fmt.Errorf("primary shard %s[%d] not initialized on %s", indexName, shardID, n.cfg.NodeID)
+	for attempt := 0; attempt < 2; attempt++ {
+		placement, err := n.ring.PlacementForShard(indexName, shardID, meta.Settings.NumberOfReplicas)
+		if err != nil {
+			return DocWriteResult{ShardID: shardID}, err
 		}
-		if strings.EqualFold(opType, "create") {
+		shardsTotal := 1 + len(placement.Replicas)
+
+		if placement.Primary.ID == n.cfg.NodeID {
+			n.mu.RLock()
+			sh := n.shards[indexName][shardID]
+			n.mu.RUnlock()
+			if sh == nil {
+				return DocWriteResult{ShardID: shardID}, fmt.Errorf("primary shard %s[%d] not initialized on %s", indexName, shardID, n.cfg.NodeID)
+			}
 			exists, err := sh.DocExists(ctx, docID)
 			if err != nil {
-				return "", 0, 0, 0, err
+				return DocWriteResult{ShardID: shardID}, err
 			}
-			if exists {
-				return "", shardID, 0, 0, fmt.Errorf("%w: [%s]: document already exists", ErrVersionConflict, docID)
+			if strings.EqualFold(opType, "create") && exists {
+				return DocWriteResult{ShardID: shardID}, fmt.Errorf("%w: [%s]: document already exists", ErrVersionConflict, docID)
 			}
+			rec, err := sh.IndexLocal(docID, rawJSON)
+			if err != nil {
+				return DocWriteResult{ShardID: shardID}, err
+			}
+			return DocWriteResult{
+				ID:          docID,
+				ShardID:     shardID,
+				CRC32C:      checksum.Sum32C(rawJSON),
+				SeqNo:       rec.Seq,
+				PrimaryTerm: sh.PrimaryTerm(),
+				Version:     rec.Seq,
+				Created:     !exists,
+				ShardsTotal: shardsTotal,
+				ShardsSucc:  1,
+			}, nil
 		}
-		rec, err := sh.IndexLocal(docID, rawJSON)
-		if err != nil {
-			return "", 0, 0, 0, err
-		}
-		return docID, shardID, checksum.Sum32C(rawJSON), rec.Seq, nil
-	}
 
-	// Forward to remote primary node.
-	var resp struct {
-		ID      string `json:"_id"`
-		ShardID int    `json:"_shard"`
-		CRC32C  uint32 `json:"_crc32c"`
-		Seq     uint64 `json:"_seq_no"`
+		// Forward to remote primary node.
+		var resp struct {
+			ID          string `json:"_id"`
+			ShardID     int    `json:"_shard"`
+			CRC32C      uint32 `json:"_crc32c"`
+			Seq         uint64 `json:"_seq_no"`
+			PrimaryTerm uint64 `json:"_primary_term"`
+			Version     uint64 `json:"_version"`
+			Result      string `json:"result"`
+		}
+		target := fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing)
+		if strings.EqualFold(opType, "create") {
+			target += "&op_type=create"
+		}
+		err = n.putJSONRaw(ctx, target, rawJSON, &resp)
+		if err == nil {
+			term := resp.PrimaryTerm
+			if term == 0 {
+				term = 1
+			}
+			ver := resp.Version
+			if ver == 0 {
+				ver = resp.Seq
+			}
+			return DocWriteResult{
+				ID:          docID,
+				ShardID:     shardID,
+				CRC32C:      resp.CRC32C,
+				SeqNo:       resp.Seq,
+				PrimaryTerm: term,
+				Version:     ver,
+				Created:     resp.Result == "created",
+				ShardsTotal: shardsTotal,
+				ShardsSucc:  1,
+			}, nil
+		}
+		if errors.Is(err, ErrVersionConflict) || attempt == 1 || !n.discoveryEnabled() {
+			return DocWriteResult{ShardID: shardID}, err
+		}
+		// Transport failure on remote primary: sync S3 membership once and retry if a new primary was promoted.
+		changed, _ := n.SyncMembershipOnce(ctx)
+		if !changed {
+			return DocWriteResult{ShardID: shardID}, err
+		}
 	}
-	target := fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing)
-	if strings.EqualFold(opType, "create") {
-		target += "&op_type=create"
-	}
-	if err := n.putJSONRaw(ctx, target, rawJSON, &resp); err != nil {
-		return "", 0, 0, 0, err
-	}
-	return docID, shardID, resp.CRC32C, resp.Seq, nil
+	return DocWriteResult{ShardID: shardID}, fmt.Errorf("write failover retries exhausted for %s[%d]", indexName, shardID)
 }
 
 // DeleteDoc routes a delete tombstone to the primary shard node.
 func (n *Node) DeleteDoc(ctx context.Context, indexName, docID, routing string) (int, uint64, error) {
+	res, err := n.DeleteDocMeta(ctx, indexName, docID, routing)
+	if err != nil {
+		return res.ShardID, 0, err
+	}
+	return res.ShardID, res.SeqNo, nil
+}
+
+// DeleteDocMeta routes a delete tombstone and returns full ES v8 metadata (_seq_no, _primary_term, _shards).
+func (n *Node) DeleteDocMeta(ctx context.Context, indexName, docID, routing string) (DocWriteResult, error) {
 	meta, ok := n.GetIndex(indexName)
 	if !ok {
-		return 0, 0, fmt.Errorf("index_not_found_exception: %s", indexName)
+		return DocWriteResult{}, fmt.Errorf("index_not_found_exception: %s", indexName)
 	}
 	if routing == "" {
 		routing = docID
 	}
 	shardID := sharding.ShardForKey(indexName, routing, meta.Settings.NumberOfShards)
-	placement, err := n.ring.PlacementForShard(indexName, shardID, meta.Settings.NumberOfReplicas)
-	if err != nil {
-		return 0, 0, err
-	}
 
-	if placement.Primary.ID == n.cfg.NodeID {
-		n.mu.RLock()
-		sh := n.shards[indexName][shardID]
-		n.mu.RUnlock()
-		if sh == nil {
-			return 0, 0, fmt.Errorf("shard %s[%d] missing", indexName, shardID)
-		}
-		rec, err := sh.DeleteLocal(docID)
+	for attempt := 0; attempt < 2; attempt++ {
+		placement, err := n.ring.PlacementForShard(indexName, shardID, meta.Settings.NumberOfReplicas)
 		if err != nil {
-			return 0, 0, err
+			return DocWriteResult{ShardID: shardID}, err
 		}
-		return shardID, rec.Seq, nil
-	}
+		shardsTotal := 1 + len(placement.Replicas)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing), nil)
-	if err != nil {
-		return 0, 0, err
+		if placement.Primary.ID == n.cfg.NodeID {
+			n.mu.RLock()
+			sh := n.shards[indexName][shardID]
+			n.mu.RUnlock()
+			if sh == nil {
+				return DocWriteResult{ShardID: shardID}, fmt.Errorf("shard %s[%d] missing", indexName, shardID)
+			}
+			rec, err := sh.DeleteLocal(docID)
+			if err != nil {
+				return DocWriteResult{ShardID: shardID}, err
+			}
+			return DocWriteResult{
+				ID:          docID,
+				ShardID:     shardID,
+				SeqNo:       rec.Seq,
+				PrimaryTerm: sh.PrimaryTerm(),
+				Version:     rec.Seq,
+				ShardsTotal: shardsTotal,
+				ShardsSucc:  1,
+			}, nil
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing), nil)
+		if err != nil {
+			return DocWriteResult{ShardID: shardID}, err
+		}
+		resp, err := n.httpClient.Do(req)
+		if err != nil {
+			if attempt == 0 && n.discoveryEnabled() {
+				if changed, _ := n.SyncMembershipOnce(ctx); changed {
+					continue
+				}
+			}
+			return DocWriteResult{ShardID: shardID}, err
+		}
+		var parsed struct {
+			Seq         uint64 `json:"_seq_no"`
+			PrimaryTerm uint64 `json:"_primary_term"`
+			Version     uint64 `json:"_version"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&parsed)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return DocWriteResult{ShardID: shardID}, fmt.Errorf("remote delete failed (%d)", resp.StatusCode)
+		}
+		term := parsed.PrimaryTerm
+		if term == 0 {
+			term = 1
+		}
+		ver := parsed.Version
+		if ver == 0 {
+			ver = parsed.Seq
+		}
+		return DocWriteResult{
+			ID:          docID,
+			ShardID:     shardID,
+			SeqNo:       parsed.Seq,
+			PrimaryTerm: term,
+			Version:     ver,
+			ShardsTotal: shardsTotal,
+			ShardsSucc:  1,
+		}, nil
 	}
-	resp, err := n.httpClient.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return 0, 0, fmt.Errorf("remote delete failed (%d)", resp.StatusCode)
-	}
-	return shardID, 0, nil
+	return DocWriteResult{ShardID: shardID}, fmt.Errorf("delete failover retries exhausted for %s[%d]", indexName, shardID)
 }
 
 // GetDoc fetches a document by _id from its owning shard (primary or replica).
 func (n *Node) GetDoc(ctx context.Context, indexName, docID, routing string) ([]byte, bool, uint32, *S3Pointer, error) {
+	res, err := n.GetDocMeta(ctx, indexName, docID, routing)
+	if err != nil {
+		return nil, false, 0, nil, err
+	}
+	return res.Source, res.Found, res.CRC32C, res.S3Pointer, nil
+}
+
+// GetDocMeta fetches a document by _id with full ES v8 metadata (_seq_no, _primary_term, _version).
+func (n *Node) GetDocMeta(ctx context.Context, indexName, docID, routing string) (DocGetResult, error) {
 	meta, ok := n.GetIndex(indexName)
 	if !ok {
-		return nil, false, 0, nil, fmt.Errorf("index_not_found_exception: %s", indexName)
+		return DocGetResult{}, fmt.Errorf("index_not_found_exception: %s", indexName)
 	}
 	if routing == "" {
 		routing = docID
@@ -974,11 +1154,11 @@ func (n *Node) GetDoc(ctx context.Context, indexName, docID, routing string) ([]
 	shardID := sharding.ShardForKey(indexName, routing, meta.Settings.NumberOfShards)
 	placement, err := n.ring.PlacementForShard(indexName, shardID, meta.Settings.NumberOfReplicas)
 	if err != nil {
-		return nil, false, 0, nil, err
+		return DocGetResult{}, err
 	}
 
 	if placement.Primary.ID == n.cfg.NodeID {
-		return n.getLocalDoc(ctx, indexName, shardID, docID)
+		return n.getLocalDocMeta(ctx, indexName, shardID, docID)
 	}
 
 	// Check if this node holds a WAL-backed replica locally first for fast reads
@@ -987,42 +1167,80 @@ func (n *Node) GetDoc(ctx context.Context, indexName, docID, routing string) ([]
 	localReplica := n.shards[indexName][shardID]
 	n.mu.RUnlock()
 	if localReplica != nil && !localReplica.readOnly {
-		return n.getLocalDoc(ctx, indexName, shardID, docID)
+		return n.getLocalDocMeta(ctx, indexName, shardID, docID)
 	}
 
-	// Forward to primary.
-	url := fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(placement.Primary.Address), indexName, docID, routing)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, 0, nil, err
-	}
-	resp, err := n.httpClient.Do(req)
-	if err != nil {
-		return nil, false, 0, nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, 0, nil, nil
-	}
-	var parsed struct {
-		Found     bool            `json:"found"`
-		Source    json.RawMessage `json:"_source"`
-		CRC32C    string          `json:"_crc32c"`
-		S3Pointer *S3Pointer      `json:"_s3_pointer,omitempty"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, false, 0, nil, err
-	}
-	var crc uint32
-	if parsed.CRC32C != "" {
-		if v, err := strconv.ParseUint(parsed.CRC32C, 16, 32); err == nil {
-			crc = uint32(v)
+	// Forward to primary, with automatic fallback to replicas if primary is unreachable.
+	candidates := make([]sharding.NodeInfo, 0, 1+len(placement.Replicas))
+	candidates = append(candidates, placement.Primary)
+	candidates = append(candidates, placement.Replicas...)
+
+	var lastErr error
+	for _, owner := range candidates {
+		if owner.Address == "" {
+			continue
 		}
+		targetURL := fmt.Sprintf("%s/%s/_doc/%s?routing=%s", baseURL(owner.Address), indexName, docID, routing)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := n.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			_ = resp.Body.Close()
+			return DocGetResult{Found: false}, nil
+		}
+		var parsed struct {
+			Found       bool            `json:"found"`
+			Source      json.RawMessage `json:"_source"`
+			CRC32C      string          `json:"_crc32c"`
+			SeqNo       uint64          `json:"_seq_no"`
+			PrimaryTerm uint64          `json:"_primary_term"`
+			Version     uint64          `json:"_version"`
+			S3Pointer   *S3Pointer      `json:"_s3_pointer,omitempty"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&parsed)
+		_ = resp.Body.Close()
+		if decErr != nil {
+			lastErr = decErr
+			continue
+		}
+		var crc uint32
+		if parsed.CRC32C != "" {
+			if v, err := strconv.ParseUint(parsed.CRC32C, 16, 32); err == nil {
+				crc = uint32(v)
+			}
+		}
+		if crc == 0 && len(parsed.Source) > 0 {
+			crc = checksum.Sum32C(parsed.Source)
+		}
+		term := parsed.PrimaryTerm
+		if term == 0 {
+			term = 1
+		}
+		ver := parsed.Version
+		if ver == 0 {
+			ver = parsed.SeqNo
+		}
+		return DocGetResult{
+			Found:       parsed.Found,
+			Source:      parsed.Source,
+			CRC32C:      crc,
+			SeqNo:       parsed.SeqNo,
+			PrimaryTerm: term,
+			Version:     ver,
+			S3Pointer:   parsed.S3Pointer,
+		}, nil
 	}
-	if crc == 0 && len(parsed.Source) > 0 {
-		crc = checksum.Sum32C(parsed.Source)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no healthy shard owner for %s[%d]", indexName, shardID)
 	}
-	return parsed.Source, parsed.Found, crc, parsed.S3Pointer, nil
+	return DocGetResult{}, lastErr
 }
 
 // DocExists checks whether docID exists in indexName (supporting HEAD /{index}/_doc/{id}).
@@ -1076,16 +1294,16 @@ func (n *Node) DocExists(ctx context.Context, indexName, docID, routing string) 
 	return true, nil
 }
 
-func (n *Node) getLocalDoc(ctx context.Context, indexName string, shardID int, docID string) ([]byte, bool, uint32, *S3Pointer, error) {
+func (n *Node) getLocalDocMeta(ctx context.Context, indexName string, shardID int, docID string) (DocGetResult, error) {
 	n.mu.RLock()
 	sh := n.shards[indexName][shardID]
 	n.mu.RUnlock()
 	if sh == nil {
-		return nil, false, 0, nil, nil
+		return DocGetResult{}, nil
 	}
 	raw, found, crc, dm, seg, err := sh.GetDocByID(ctx, docID)
 	if err != nil || !found {
-		return nil, found, 0, nil, err
+		return DocGetResult{Found: found}, err
 	}
 	var ptr *S3Pointer
 	if seg != nil && seg.DocsObjectKey != "" && n.s3 != nil {
@@ -1102,7 +1320,15 @@ func (n *Node) getLocalDoc(ctx context.Context, indexName string, shardID int, d
 			}
 		}
 	}
-	return raw, true, crc, ptr, nil
+	return DocGetResult{
+		Found:       true,
+		Source:      raw,
+		CRC32C:      crc,
+		SeqNo:       dm.Seq,
+		PrimaryTerm: sh.PrimaryTerm(),
+		Version:     dm.Seq,
+		S3Pointer:   ptr,
+	}, nil
 }
 
 // RefreshIndex refreshes local NRT memtables and optionally flushes buffered writes to S3.
@@ -1119,7 +1345,7 @@ func (n *Node) RefreshIndex(ctx context.Context, indexName string, flushToS3 boo
 		if err := sh.Refresh(); err != nil {
 			return err
 		}
-		if flushToS3 && sh.isPrimary && n.s3 != nil {
+		if flushToS3 && sh.IsPrimary() && n.s3 != nil {
 			if _, err := sh.FlushToS3(ctx); err != nil {
 				return err
 			}
@@ -1661,7 +1887,7 @@ func (n *Node) ForceMergeLocal(ctx context.Context, indexName string, opts Force
 	shardMap := n.shards[indexName]
 	var primaries []*Shard
 	for _, sh := range shardMap {
-		if sh.isPrimary {
+		if sh.IsPrimary() {
 			primaries = append(primaries, sh)
 		}
 	}
@@ -1704,7 +1930,7 @@ func (n *Node) LocalShardSegments(indexName string) []ShardStats {
 			continue
 		}
 		for _, sh := range m {
-			if sh.isPrimary {
+			if sh.IsPrimary() {
 				out = append(out, sh.Stats())
 			}
 		}
@@ -1852,7 +2078,7 @@ func (n *Node) RunMergeAndGCOnce(ctx context.Context) (mergesRun int, gcDeleted 
 	var primaries []*Shard
 	for _, m := range n.shards {
 		for _, sh := range m {
-			if sh.isPrimary {
+			if sh.IsPrimary() {
 				primaries = append(primaries, sh)
 			}
 		}
@@ -1901,10 +2127,13 @@ func (n *Node) mergeLoop() {
 	}
 }
 
-// ReplicationStats reports async WAL replication, S3 flush, segment merge, and GC diagnostics.
+// ReplicationStats reports async WAL replication, S3 flush, segment merge, failover, and GC diagnostics.
 type ReplicationStats struct {
 	NodeID                 string       `json:"node_id"`
 	Roles                  []string     `json:"roles"`
+	DiscoveryMode          string       `json:"discovery_mode"`
+	Draining               bool         `json:"draining"`
+	PromotionsCompleted    int64        `json:"promotions_completed"`
 	ReplicationBatchesSent int64        `json:"replication_batches_sent"`
 	ReplicationErrors      int64        `json:"replication_errors"`
 	S3SegmentFlushes       int64        `json:"s3_segment_flushes"`
@@ -1918,7 +2147,7 @@ type ReplicationStats struct {
 	Shards                 []ShardStats `json:"shards"`
 }
 
-// Stats returns node-level replication, flush, merge, GC, NVMe cache, and shard diagnostics.
+// Stats returns node-level replication, flush, merge, failover, GC, NVMe cache, and shard diagnostics.
 func (n *Node) Stats() ReplicationStats {
 	n.mu.RLock()
 	var shardStats []ShardStats
@@ -1941,6 +2170,9 @@ func (n *Node) Stats() ReplicationStats {
 	return ReplicationStats{
 		NodeID:                 n.cfg.NodeID,
 		Roles:                  n.Roles(),
+		DiscoveryMode:          n.cfg.Discovery.Mode,
+		Draining:               n.draining.Load(),
+		PromotionsCompleted:    n.promotionsCompleted.Load(),
 		ReplicationBatchesSent: n.repSuccess.Load(),
 		ReplicationErrors:      n.repErrors.Load(),
 		S3SegmentFlushes:       n.flushes.Load(),
@@ -1979,7 +2211,7 @@ func (n *Node) replicateOnce(ctx context.Context) {
 	for idxName, m := range n.shards {
 		meta := n.indices[idxName]
 		for _, sh := range m {
-			if sh.isPrimary {
+			if sh.IsPrimary() {
 				work = append(work, shardWork{meta: meta, sh: sh})
 			}
 		}
@@ -2044,7 +2276,7 @@ func (n *Node) flushLoop() {
 			var primaries []*Shard
 			for _, m := range n.shards {
 				for _, sh := range m {
-					if sh.isPrimary {
+					if sh.IsPrimary() {
 						primaries = append(primaries, sh)
 					}
 				}

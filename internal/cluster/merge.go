@@ -206,7 +206,7 @@ func SelectTieredMergeBatch(segments []SegmentRef, cfg MergeConfig) (startIdx, e
 // deterministically purging tombstones when startIdx == 0, pre-warming NVMe cache,
 // atomically swapping manifest.json on S3, and scheduling replaced objects for delayed S3 GC.
 func (s *Shard) MergeRange(ctx context.Context, startIdx, endIdx int) (MergeResult, error) {
-	if s.readOnly || !s.isPrimary {
+	if s.readOnly || !s.IsPrimary() {
 		return MergeResult{}, nil
 	}
 	if s.s3 == nil {
@@ -218,7 +218,7 @@ func (s *Shard) MergeRange(ctx context.Context, startIdx, endIdx int) (MergeResu
 	defer s.flushMu.Unlock()
 
 	s.mu.RLock()
-	if startIdx < 0 || endIdx >= len(s.segments) || startIdx > endIdx {
+	if !s.isPrimary || startIdx < 0 || endIdx >= len(s.segments) || startIdx > endIdx {
 		s.mu.RUnlock()
 		return MergeResult{}, nil
 	}
@@ -230,6 +230,14 @@ func (s *Shard) MergeRange(ctx context.Context, startIdx, endIdx int) (MergeResu
 	allBefore := append([]SegmentRef(nil), s.segments[:startIdx]...)
 	allAfter := append([]SegmentRef(nil), s.segments[endIdx+1:]...)
 	flushedSeq := s.flushedSeq
+	localTerm := s.primaryTerm
+	if localTerm == 0 {
+		localTerm = 1
+	}
+	ownerNodeID := s.ownerNodeID
+	if ownerNodeID == "" {
+		ownerNodeID = s.primaryNode
+	}
 	nextCounter := s.segCounter + 1
 	retiredBefore := append([]RetiredSegmentRef(nil), s.retiredSegments...)
 	s.mu.RUnlock()
@@ -395,9 +403,15 @@ func (s *Shard) MergeRange(ctx context.Context, startIdx, endIdx int) (MergeResu
 		})
 	}
 
+	if err := s.checkPrimaryTermFencing(ctx, localTerm, ownerNodeID); err != nil {
+		return MergeResult{}, err
+	}
+
 	man := ShardManifest{
 		IndexName:       s.indexName,
 		ShardID:         s.shardID,
+		PrimaryTerm:     localTerm,
+		PrimaryNode:     ownerNodeID,
 		FlushedSeq:      flushedSeq,
 		NextSegCounter:  nextCounter,
 		Segments:        nextSegments,
@@ -457,7 +471,7 @@ func (s *Shard) MergeRange(ctx context.Context, startIdx, endIdx int) (MergeResu
 
 // MergeIfNeeded evaluates TieredMergePolicy on this shard and executes one bounded merge pass if warranted.
 func (s *Shard) MergeIfNeeded(ctx context.Context, cfg MergeConfig) (MergeResult, error) {
-	if s.readOnly || !s.isPrimary || s.s3 == nil {
+	if s.readOnly || !s.IsPrimary() || s.s3 == nil {
 		return MergeResult{}, nil
 	}
 	s.mu.RLock()
@@ -474,7 +488,7 @@ func (s *Shard) MergeIfNeeded(ctx context.Context, cfg MergeConfig) (MergeResult
 // ForceMerge compacts segments according to Elasticsearch _forcemerge semantics
 // (max_num_segments or only_expunge_deletes).
 func (s *Shard) ForceMerge(ctx context.Context, opts ForceMergeOptions) (MergeResult, error) {
-	if s.readOnly || !s.isPrimary || s.s3 == nil {
+	if s.readOnly || !s.IsPrimary() || s.s3 == nil {
 		return MergeResult{}, nil
 	}
 	if opts.Flush {
@@ -522,7 +536,7 @@ func (s *Shard) ForceMerge(ctx context.Context, opts ForceMergeOptions) (MergeRe
 // SweepRetiredS3Objects deletes retired segment .idx and .docs objects from S3 once their
 // grace period has elapsed and updates manifest.json to prune them.
 func (s *Shard) SweepRetiredS3Objects(ctx context.Context, grace time.Duration) (GCResult, error) {
-	if s.readOnly || !s.isPrimary || s.s3 == nil {
+	if s.readOnly || !s.IsPrimary() || s.s3 == nil {
 		return GCResult{}, nil
 	}
 
@@ -530,14 +544,29 @@ func (s *Shard) SweepRetiredS3Objects(ctx context.Context, grace time.Duration) 
 	defer s.flushMu.Unlock()
 
 	s.mu.RLock()
+	if !s.isPrimary {
+		s.mu.RUnlock()
+		return GCResult{}, nil
+	}
 	retired := append([]RetiredSegmentRef(nil), s.retiredSegments...)
 	segments := append([]SegmentRef(nil), s.segments...)
 	flushedSeq := s.flushedSeq
 	segCounter := s.segCounter
+	localTerm := s.primaryTerm
+	if localTerm == 0 {
+		localTerm = 1
+	}
+	ownerNodeID := s.ownerNodeID
+	if ownerNodeID == "" {
+		ownerNodeID = s.primaryNode
+	}
 	s.mu.RUnlock()
 
 	if len(retired) == 0 {
 		return GCResult{}, nil
+	}
+	if err := s.checkPrimaryTermFencing(ctx, localTerm, ownerNodeID); err != nil {
+		return GCResult{PendingObjects: len(retired) * 2}, err
 	}
 
 	now := time.Now().UTC()
@@ -580,6 +609,8 @@ func (s *Shard) SweepRetiredS3Objects(ctx context.Context, grace time.Duration) 
 	man := ShardManifest{
 		IndexName:       s.indexName,
 		ShardID:         s.shardID,
+		PrimaryTerm:     localTerm,
+		PrimaryNode:     ownerNodeID,
 		FlushedSeq:      flushedSeq,
 		NextSegCounter:  segCounter,
 		Segments:        segments,

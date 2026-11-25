@@ -74,8 +74,13 @@ func runServe(args []string) {
 	nodeID := fs.String("node-id", "node-1", "Cluster node identifier")
 	rolesFlag := fs.String("roles", "data", "Comma-separated node roles: data, coordinator, reader")
 	listenAddr := fs.String("listen", ":9200", "HTTP listen address")
+	advertiseAddr := fs.String("advertise", "", "Advertised host:port for peer & S3 membership discovery (defaults to --listen)")
 	pprofAddr := fs.String("pprof", "127.0.0.1:6060", "Optional pprof HTTP debug address (empty to disable)")
 	peersFlag := fs.String("peers", "", "Comma-separated peer specs id=host:port[@role1+role2]")
+	discoveryMode := fs.String("discovery-mode", cluster.DiscoveryModeHybrid, "Cluster discovery mode: hybrid, s3, or static")
+	heartbeatSec := fs.Int("heartbeat-sec", 5, "S3 node lease heartbeat interval in seconds")
+	leaseTTLSec := fs.Int("lease-ttl-sec", 15, "S3 node lease expiration TTL in seconds before automated failover")
+	membershipSyncSec := fs.Int("membership-sync-sec", 5, "Background S3 membership & shard reconciliation interval in seconds")
 	s3Endpoint := fs.String("s3-endpoint", "", "S3-compatible endpoint URL (AWS S3 or MinIO)")
 	s3Bucket := fs.String("s3-bucket", "cindersearch", "S3 bucket name")
 	s3Region := fs.String("s3-region", "us-east-1", "S3 region")
@@ -133,14 +138,25 @@ func runServe(args []string) {
 		log.Fatalf("invalid merge flags: %v", err)
 	}
 
+	discoveryCfg, err := buildDiscoveryConfig(*discoveryMode, *heartbeatSec, *leaseTTLSec, *membershipSyncSec)
+	if err != nil {
+		log.Fatalf("invalid discovery flags: %v", err)
+	}
+
+	advAddr := strings.TrimSpace(*advertiseAddr)
+	if advAddr == "" {
+		advAddr = *listenAddr
+	}
+
 	node, err := cluster.NewNode(cluster.NodeConfig{
 		NodeID:           *nodeID,
 		Roles:            roles,
-		AdvertiseAddress: *listenAddr,
+		AdvertiseAddress: advAddr,
 		NVMeDir:          *nvmeDir,
 		NVMeMaxBytes:     *nvmeMaxMB * 1024 * 1024,
 		FlushInterval:    time.Duration(*flushSec) * time.Second,
 		Merge:            mergeCfg,
+		Discovery:        discoveryCfg,
 		S3:               s3Client,
 		Peers:            peers,
 	})
@@ -154,7 +170,7 @@ func runServe(args []string) {
 		Handler: api.NewHandler(node),
 	}
 
-	log.Printf("%s roles=%s", api.FormatEndpointBanner(*nodeID, *listenAddr, endpoint), strings.Join(node.Roles(), ","))
+	log.Printf("%s advertise=%s roles=%s discovery=%s", api.FormatEndpointBanner(*nodeID, *listenAddr, endpoint), advAddr, strings.Join(node.Roles(), ","), discoveryCfg.Mode)
 
 	var pprofSrv *http.Server
 	if *pprofAddr != "" {
@@ -177,6 +193,15 @@ func runServe(args []string) {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		res, err := node.Drain(drainCtx)
+		drainCancel()
+		if err != nil {
+			log.Printf("graceful drain error: %v", err)
+		} else {
+			log.Printf("graceful drain complete: node=%s shards_flushed=%d segments_flushed=%d lease_removed=%t",
+				res.NodeID, res.ShardsFlushed, res.SegmentsFlushed, res.LeaseRemoved)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
@@ -666,5 +691,59 @@ func buildMergeConfig(intervalSec, maxSegments int, maxBytesMB int64, maxConcurr
 		MaxConcurrentMerges:   maxConcurrent,
 		ReclaimDeletesRatio:   reclaimRatio,
 		S3GCGrace:             time.Duration(gcGraceSec) * time.Second,
+	}, nil
+}
+
+func buildDiscoveryConfig(mode string, heartbeatSec, leaseTTLSec, syncSec int) (cluster.DiscoveryConfig, error) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case cluster.DiscoveryModeHybrid, cluster.DiscoveryModeS3, cluster.DiscoveryModeStatic:
+	default:
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--discovery-mode must be one of hybrid, s3, static (got %q)", mode)
+	}
+	if heartbeatSec < 1 {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--heartbeat-sec must be >= 1")
+	}
+	if leaseTTLSec < 2 {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--lease-ttl-sec must be >= 2")
+	}
+	if leaseTTLSec <= heartbeatSec {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--lease-ttl-sec (%d) must be greater than --heartbeat-sec (%d)", leaseTTLSec, heartbeatSec)
+	}
+	if syncSec < 1 {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--membership-sync-sec must be >= 1")
+	}
+	return cluster.DiscoveryConfig{
+		Mode:              m,
+		HeartbeatInterval: time.Duration(heartbeatSec) * time.Second,
+		LeaseTTL:          time.Duration(leaseTTLSec) * time.Second,
+		SyncInterval:      time.Duration(syncSec) * time.Second,
+	}, nil
+}
+
+func buildDiscoveryConfig(mode string, heartbeatSec, leaseTTLSec, syncSec int) (cluster.DiscoveryConfig, error) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case cluster.DiscoveryModeHybrid, cluster.DiscoveryModeS3, cluster.DiscoveryModeStatic:
+	default:
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--discovery-mode must be one of hybrid, s3, static (got %q)", mode)
+	}
+	if heartbeatSec < 1 {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--heartbeat-sec must be >= 1")
+	}
+	if leaseTTLSec < 2 {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--lease-ttl-sec must be >= 2")
+	}
+	if leaseTTLSec <= heartbeatSec {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--lease-ttl-sec (%d) must be greater than --heartbeat-sec (%d)", leaseTTLSec, heartbeatSec)
+	}
+	if syncSec < 1 {
+		return cluster.DiscoveryConfig{}, fmt.Errorf("--membership-sync-sec must be >= 1")
+	}
+	return cluster.DiscoveryConfig{
+		Mode:              m,
+		HeartbeatInterval: time.Duration(heartbeatSec) * time.Second,
+		LeaseTTL:          time.Duration(leaseTTLSec) * time.Second,
+		SyncInterval:      time.Duration(syncSec) * time.Second,
 	}, nil
 }

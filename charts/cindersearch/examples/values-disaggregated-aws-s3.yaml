@@ -5,6 +5,16 @@
 
 cluster:
   topology: disaggregated
+  discovery:
+    mode: hybrid
+    heartbeatSec: 5
+    leaseTTLSec: 15
+    syncSec: 5
+  discovery:
+    mode: hybrid
+    heartbeatSec: 5
+    leaseTTLSec: 15
+    syncSec: 5
 
 serviceAccount:
   create: true
@@ -31,6 +41,8 @@ data:
   roles:
     - data
   nvmeMaxMB: 4096
+  drain:
+    enabled: true
   persistence:
     enabled: true
     # storageClass: gp3
@@ -70,6 +82,8 @@ reader:
   roles:
     - reader
   nvmeMaxMB: 4096
+  drain:
+    enabled: true
   persistence:
     enabled: false
   ephemeralCacheSizeLimit: 8Gi

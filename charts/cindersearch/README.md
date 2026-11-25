@@ -81,6 +81,10 @@ helm template cindersearch ./charts/cindersearch -f ./charts/cindersearch/exampl
 | Key | Default | Description |
 | --- | --- | --- |
 | `cluster.topology` | `multi-node` | Topology mode (`single`, `multi-node`, `disaggregated`) |
+| `cluster.discovery.mode` | `hybrid` | Dynamic S3-lease membership discovery mode (`hybrid`, `s3`, `static`) |
+| `cluster.discovery.heartbeatSec` | `5` | Node heartbeat lease refresh interval in S3 (`_cluster/nodes/<id>.json`) |
+| `cluster.discovery.leaseTTLSec` | `15` | Lease expiration TTL (seconds) before automated replica-to-primary promotion |
+| `cluster.discovery.syncSec` | `5` | Background membership & shard reconciliation interval (seconds) |
 | `s3.mode` | `minio` | S3 backend (`minio`, `external`, `embedded`) |
 | `s3.bucket` | `cindersearch` | S3 bucket name for immutable segments & manifests |
 | `s3.region` | `us-east-1` | AWS / S3 signing region |
@@ -89,6 +93,7 @@ helm template cindersearch ./charts/cindersearch -f ./charts/cindersearch/exampl
 | `s3.external.existingSecret` | `""` | Existing K8s Secret with `AWS_ACCESS_KEY_ID` & `AWS_SECRET_ACCESS_KEY` |
 | `data.replicaCount` | `3` | Number of multi-master `data` StatefulSet pods |
 | `data.nvmeMaxMB` | `1024` | Bounded local NVMe LRU read cache budget per data pod (MB) |
+| `data.drain.enabled` | `true` | Run `preStop` `POST /_cinder/drain` hook to flush WALs & remove lease before termination |
 | `data.persistence.storageClass` | `""` | StorageClass for NVMe WAL + cache PVCs |
 | `coordinator.enabled` | `false` | Deploy stateless `coordinator` gateway pool |
 | `coordinator.replicaCount` | `2` | Number of `coordinator` pods when enabled |

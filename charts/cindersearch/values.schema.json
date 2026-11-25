@@ -10,7 +10,19 @@
           "type": "string",
           "enum": ["single", "multi-node", "disaggregated"]
         },
-        "domain": { "type": "string", "minLength": 1 }
+        "domain": { "type": "string", "minLength": 1 },
+        "discovery": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["hybrid", "s3", "static"]
+            },
+            "heartbeatSec": { "type": "integer", "minimum": 1 },
+            "leaseTTLSec": { "type": "integer", "minimum": 2 },
+            "syncSec": { "type": "integer", "minimum": 1 }
+          }
+        }
       }
     },
     "s3": {
@@ -69,6 +81,12 @@
         "antiAffinity": {
           "type": "string",
           "enum": ["soft", "hard", "none"]
+        },
+        "drain": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
         }
       }
     },
@@ -80,6 +98,12 @@
         "antiAffinity": {
           "type": "string",
           "enum": ["soft", "hard", "none"]
+        },
+        "drain": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
         }
       }
     },

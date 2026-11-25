@@ -37,8 +37,8 @@ const MAKE_TARGETS = [
 const ES_COMPAT_MATRIX = [
   {
     surface: 'Index, Mapping & Cluster REST',
-    endpoints: 'GET /, HEAD/PUT/GET/DELETE /{index}, GET/PUT /{index}/_mapping, GET/POST /_count, GET /_cluster/health, /_nodes, /_cat/{nodes,indices,shards}, POST /{index}/_refresh',
-    notes: 'X-Elastic-Product: Elasticsearch & ES v8 media-type negotiation, S3-persisted cold-boot cluster metadata (_cluster/indices/*.json)',
+    endpoints: 'GET /, HEAD/PUT/GET/DELETE /{index}, GET/PUT /{index}/_mapping, GET/POST /_count, GET /_cluster/health[/{index}] (?wait_for_status, ?level), GET /_cluster/state[/{metrics}], /_nodes, /_cat/{nodes,indices,shards,segments} (?v, ?h, ?format=text|json)',
+    notes: 'X-Elastic-Product: Elasticsearch & ES v8 media-type negotiation, authentic green/yellow/red health & S3-persisted cold-boot cluster metadata',
   },
   {
     surface: 'Aliases & Wildcard Patterns',
@@ -46,14 +46,14 @@ const ES_COMPAT_MATRIX = [
     notes: 'Atomic add/remove alias swaps persisted to S3 and expanded across _search, _count, _mapping, and _refresh',
   },
   {
-    surface: 'Node Roles & Routing',
-    endpoints: '--roles=data|coordinator|reader, --peers=id=host:port[@role1+role2], ?preference=reader (X-Cinder-Preference)',
-    notes: 'Only data nodes own shard WALs; coordinators are stateless routers; readers serve flushed S3+NVMe queries with automatic failover',
+    surface: 'Dynamic Membership & Failover',
+    endpoints: '--discovery-mode=hybrid|s3|static, --advertise, --roles=data|coordinator|reader, ?preference=reader, GET /_cinder/membership, POST /_cinder/drain',
+    notes: 'Gossip-free S3 heartbeat leases (_cluster/nodes/<id>.json), automated replica-to-primary promotion with primary_term fencing & zero-downtime preStop drain',
   },
   {
     surface: 'Document CRUD & Bulk',
     endpoints: 'PUT/POST /{index}/_doc/{id}, PUT /{index}/_create/{id} (?op_type=create), HEAD/GET/DELETE /{index}/_doc/{id}, POST /{index}/_update/{id}, POST /_bulk',
-    notes: '409 Conflict on duplicate create, strict JSON object validation, NDJSON bulk streaming, CRC32C digests & sub-ms NVMe WAL ACK',
+    notes: 'ES v8 _version/_seq_no/_primary_term/_shards metadata, 409 Conflict on duplicate create, failover retry, CRC32C digests & sub-ms NVMe WAL ACK',
   },
   {
     surface: 'Full-Text Query DSL',

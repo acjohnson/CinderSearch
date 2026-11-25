@@ -47,7 +47,14 @@ spec:
             - --node-id=$(POD_NAME)
             - --roles={{ join "," .Values.coordinator.roles }}
             - --listen=:{{ .Values.engine.listenPort }}
+            - --advertise=$(POD_NAME).{{ $fullname }}-coordinator-headless.{{ .Release.Namespace }}.svc.{{ .Values.cluster.domain }}:{{ .Values.engine.listenPort }}
+            - --discovery-mode={{ .Values.cluster.discovery.mode }}
+            - --heartbeat-sec={{ .Values.cluster.discovery.heartbeatSec }}
+            - --lease-ttl-sec={{ .Values.cluster.discovery.leaseTTLSec }}
+            - --membership-sync-sec={{ .Values.cluster.discovery.syncSec }}
+            {{- if ne .Values.cluster.discovery.mode "s3" }}
             - --peers={{ $peers }}
+            {{- end }}
             - --nvme-dir={{ .Values.coordinator.nvmeDir }}
             - --nvme-max-mb={{ .Values.coordinator.nvmeMaxMB }}
             - --flush-sec={{ .Values.engine.flushSec }}

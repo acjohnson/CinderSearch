@@ -839,6 +839,165 @@ func TestESForceMergeAndSegmentInspectionEndpoints(t *testing.T) {
 	}
 }
 
+func TestESv8ClusterHealthStateCatTextAndDocMetaFidelity(t *testing.T) {
+	_, srvs, _, _ := newTestCluster(t, 2, 16*1024*1024)
+
+	// 1. Create a 2-shard, 1-replica index on 2 data nodes -> green health.
+	code, _ := doJSONReq(t, http.MethodPut, srvs[0].URL+"/orders", `{"settings":{"number_of_shards":2,"number_of_replicas":1}}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("create orders failed: %d", code)
+	}
+
+	code, health := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_cluster/health/orders?level=shards&wait_for_status=green&timeout=1s", "", nil)
+	if code != http.StatusOK || health["status"] != "green" || health["timed_out"] != false {
+		t.Fatalf("expected green health with shards detail: code=%d body=%+v", code, health)
+	}
+	if int(health["active_primary_shards"].(float64)) != 2 ||
+		int(health["active_shards"].(float64)) != 4 ||
+		int(health["unassigned_shards"].(float64)) != 0 {
+		t.Fatalf("unexpected shard counts in green health: %+v", health)
+	}
+	indicesObj := health["indices"].(map[string]any)
+	ordersHealth := indicesObj["orders"].(map[string]any)
+	shard0 := ordersHealth["shards"].(map[string]any)["0"].(map[string]any)
+	if shard0["primary_active"] != true || shard0["status"] != "green" {
+		t.Fatalf("unexpected shard-level health detail: %+v", shard0)
+	}
+
+	// 2. Verify /_cluster/state and metric filtering (/_cluster/state/nodes,routing_table).
+	code, fullState := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_cluster/state", "", nil)
+	if code != http.StatusOK || fullState["nodes"] == nil || fullState["metadata"] == nil || fullState["routing_table"] == nil {
+		t.Fatalf("unexpected full /_cluster/state: code=%d body=%+v", code, fullState)
+	}
+	code, filteredState := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_cluster/state/nodes,routing_table", "", nil)
+	if code != http.StatusOK || filteredState["nodes"] == nil || filteredState["routing_table"] == nil {
+		t.Fatalf("unexpected filtered /_cluster/state: code=%d body=%+v", code, filteredState)
+	}
+	if _, hasMeta := filteredState["metadata"]; hasMeta {
+		t.Fatalf("expected metadata omitted when requesting /_cluster/state/nodes,routing_table")
+	}
+
+	// 3. Verify ES v8 _version, _seq_no, _primary_term, result, and _shards on PUT, GET, _update, _bulk, DELETE.
+	code, putRes := doJSONReq(t, http.MethodPut, srvs[0].URL+"/orders/_doc/o1", `{"item":"keyboard","qty":1}`, nil)
+	if code != http.StatusOK || putRes["result"] != "created" {
+		t.Fatalf("expected PUT create result: code=%d body=%+v", code, putRes)
+	}
+	if int(putRes["_primary_term"].(float64)) < 1 || int(putRes["_version"].(float64)) < 1 || int(putRes["_seq_no"].(float64)) < 1 {
+		t.Fatalf("missing ES v8 write metadata on PUT: %+v", putRes)
+	}
+	putShards := putRes["_shards"].(map[string]any)
+	if int(putShards["total"].(float64)) != 2 || int(putShards["successful"].(float64)) != 1 || int(putShards["failed"].(float64)) != 0 {
+		t.Fatalf("unexpected _shards on PUT: %+v", putShards)
+	}
+
+	code, getRes := doJSONReq(t, http.MethodGet, srvs[1].URL+"/orders/_doc/o1", "", nil)
+	if code != http.StatusOK || getRes["found"] != true || int(getRes["_primary_term"].(float64)) < 1 || int(getRes["_version"].(float64)) < 1 {
+		t.Fatalf("missing ES v8 metadata on GET: code=%d body=%+v", code, getRes)
+	}
+
+	code, updRes := doJSONReq(t, http.MethodPost, srvs[0].URL+"/orders/_update/o1", `{"doc":{"qty":2}}`, nil)
+	if code != http.StatusOK || updRes["result"] != "updated" || int(updRes["_primary_term"].(float64)) < 1 || updRes["_shards"] == nil {
+		t.Fatalf("missing ES v8 metadata on _update: code=%d body=%+v", code, updRes)
+	}
+
+	bulkPayload := "{\"index\":{\"_index\":\"orders\",\"_id\":\"o2\"}}\n{\"item\":\"mouse\",\"qty\":3}\n"
+	code, bulkRes := doJSONReq(t, http.MethodPost, srvs[0].URL+"/_bulk", bulkPayload, nil)
+	if code != http.StatusOK || bulkRes["errors"] != false {
+		t.Fatalf("bulk failed: code=%d body=%+v", code, bulkRes)
+	}
+	bulkItem := bulkRes["items"].([]any)[0].(map[string]any)["index"].(map[string]any)
+	if int(bulkItem["_primary_term"].(float64)) < 1 || int(bulkItem["_version"].(float64)) < 1 || bulkItem["_shards"] == nil {
+		t.Fatalf("missing ES v8 metadata on _bulk item: %+v", bulkItem)
+	}
+
+	code, delRes := doJSONReq(t, http.MethodDelete, srvs[0].URL+"/orders/_doc/o2", "", nil)
+	if code != http.StatusOK || delRes["result"] != "deleted" || int(delRes["_primary_term"].(float64)) < 1 || delRes["_shards"] == nil {
+		t.Fatalf("missing ES v8 metadata on DELETE: code=%d body=%+v", code, delRes)
+	}
+
+	// Flush so /_cat/segments has committed segments to render in text mode.
+	code, _ = doJSONReq(t, http.MethodPost, srvs[0].URL+"/orders/_refresh?flush=true", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("flush orders failed: %d", code)
+	}
+
+	// 4. Verify plain-text tabular /_cat/* formatting with ?v, ?h=, and ?format=json override.
+	for _, tc := range []struct {
+		path   string
+		header string
+		rowSub string
+	}{
+		{"/_cat/nodes?v", "node.role", "node-1"},
+		{"/_cat/indices?v", "health", "orders"},
+		{"/_cat/shards?v", "prirep", "STARTED"},
+		{"/_cat/segments?v&h=index,shard,segment", "segment", "orders"},
+	} {
+		resp, err := http.Get(srvs[0].URL + tc.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.path, err)
+		}
+		ct := resp.Header.Get("Content-Type")
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		bodyText := string(bodyBytes)
+		if resp.StatusCode != http.StatusOK || !strings.HasPrefix(ct, "text/plain") {
+			t.Fatalf("expected 200 text/plain for %s, got code=%d ct=%q body=%q", tc.path, resp.StatusCode, ct, bodyText)
+		}
+		if !strings.Contains(bodyText, tc.header) || !strings.Contains(bodyText, tc.rowSub) {
+			t.Fatalf("expected header %q and value %q in %s output:\n%s", tc.header, tc.rowSub, tc.path, bodyText)
+		}
+	}
+
+	// Verify ?v&format=json explicitly returns JSON array.
+	jsonCatResp, err := http.Get(srvs[0].URL + "/_cat/indices?v&format=json")
+	if err != nil {
+		t.Fatalf("GET /_cat/indices?v&format=json: %v", err)
+	}
+	var jsonCatRows []map[string]any
+	if err := json.NewDecoder(jsonCatResp.Body).Decode(&jsonCatRows); err != nil {
+		_ = jsonCatResp.Body.Close()
+		t.Fatalf("expected JSON array for format=json: %v", err)
+	}
+	_ = jsonCatResp.Body.Close()
+	if len(jsonCatRows) != 1 || jsonCatRows[0]["health"] != "green" {
+		t.Fatalf("unexpected format=json cat indices: %+v", jsonCatRows)
+	}
+
+	// 5. Create an under-replicated index (2 replicas on 2 data nodes) -> yellow health & wait_for_status=green timeout (408).
+	code, _ = doJSONReq(t, http.MethodPut, srvs[0].URL+"/replicated", `{"settings":{"number_of_shards":1,"number_of_replicas":2}}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("create replicated index failed: %d", code)
+	}
+	code, yellowHealth := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_cluster/health?wait_for_status=green&timeout=100ms", "", nil)
+	if code != http.StatusRequestTimeout || yellowHealth["status"] != "yellow" || yellowHealth["timed_out"] != true {
+		t.Fatalf("expected 408 timed_out yellow health, got code=%d body=%+v", code, yellowHealth)
+	}
+	if int(yellowHealth["unassigned_shards"].(float64)) != 1 {
+		t.Fatalf("expected 1 unassigned replica shard, got %+v", yellowHealth)
+	}
+
+	// Verify /_cat/shards reports the UNASSIGNED replica row.
+	catShardsResp, err := http.Get(srvs[0].URL + "/_cat/shards?v")
+	if err != nil {
+		t.Fatalf("GET /_cat/shards?v: %v", err)
+	}
+	catShardsBody, _ := io.ReadAll(catShardsResp.Body)
+	_ = catShardsResp.Body.Close()
+	if !strings.Contains(string(catShardsBody), "UNASSIGNED") {
+		t.Fatalf("expected UNASSIGNED replica in /_cat/shards?v:\n%s", string(catShardsBody))
+	}
+
+	// 6. Verify /_cinder/membership and POST /_cinder/drain endpoints.
+	code, memSnap := doJSONReq(t, http.MethodGet, srvs[0].URL+"/_cinder/membership", "", nil)
+	if code != http.StatusOK || memSnap["node_id"] != "node-1" || memSnap["active_nodes"] == nil {
+		t.Fatalf("unexpected /_cinder/membership: code=%d body=%+v", code, memSnap)
+	}
+	code, drainRes := doJSONReq(t, http.MethodPost, srvs[1].URL+"/_cinder/drain", "", nil)
+	if code != http.StatusOK || drainRes["draining"] != true || drainRes["node_id"] != "node-2" {
+		t.Fatalf("unexpected /_cinder/drain: code=%d body=%+v", code, drainRes)
+	}
+}
+
 func FuzzESBulkNDJSON(f *testing.F) {
 	s3Srv := s3store.NewMockServer("ak-fz", "sk-fz", "us-east-1")
 	defer s3Srv.Close()

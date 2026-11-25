@@ -111,6 +111,9 @@ Validate chart configuration combinations early during helm template/install
 {{- if and (eq .Values.s3.mode "external") (not .Values.s3.external.existingSecret) (or (empty .Values.s3.external.accessKey) (empty .Values.s3.external.secretKey)) -}}
 {{- fail "When s3.mode=external, set either s3.external.existingSecret or both s3.external.accessKey and s3.external.secretKey" -}}
 {{- end -}}
+{{- if le (int .Values.cluster.discovery.leaseTTLSec) (int .Values.cluster.discovery.heartbeatSec) -}}
+{{- fail "cluster.discovery.leaseTTLSec must be strictly greater than cluster.discovery.heartbeatSec" -}}
+{{- end -}}
 {{- end }}
 
 {{/*

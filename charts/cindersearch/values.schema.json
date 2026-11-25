@@ -98,12 +98,6 @@
         "antiAffinity": {
           "type": "string",
           "enum": ["soft", "hard", "none"]
-        },
-        "drain": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" }
-          }
         }
       }
     },

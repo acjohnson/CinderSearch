@@ -188,58 +188,6 @@ func equalStringSlice(a, b []string) bool {
 	return true
 }
 
-// ReplaceNodes atomically replaces the ring's membership set and rebuilds virtual nodes
-// only when the active node list, addresses, or roles changed. Returns true if changed.
-func (r *Ring) ReplaceNodes(nodes []NodeInfo) bool {
-	next := make(map[string]NodeInfo, len(nodes))
-	for _, n := range nodes {
-		if n.ID == "" {
-			continue
-		}
-		roles := append([]string(nil), n.Roles...)
-		if len(roles) == 0 {
-			roles = []string{RoleData}
-		} else {
-			sort.Strings(roles)
-		}
-		n.Roles = roles
-		next[n.ID] = n
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if len(next) == len(r.nodes) {
-		same := true
-		for id, nw := range next {
-			cur, ok := r.nodes[id]
-			if !ok || cur.Address != nw.Address || !equalStringSlice(cur.NormalizedRoles(), nw.NormalizedRoles()) {
-				same = false
-				break
-			}
-		}
-		if same {
-			return false
-		}
-	}
-
-	r.nodes = next
-	r.rebuild()
-	return true
-}
-
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // Nodes returns a sorted snapshot of all registered cluster nodes (data, coordinator, reader).
 func (r *Ring) Nodes() []NodeInfo {
 	r.mu.RLock()

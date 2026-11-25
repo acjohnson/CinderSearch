@@ -10,11 +10,6 @@ cluster:
     heartbeatSec: 5
     leaseTTLSec: 15
     syncSec: 5
-  discovery:
-    mode: hybrid
-    heartbeatSec: 5
-    leaseTTLSec: 15
-    syncSec: 5
 
 serviceAccount:
   create: true
@@ -82,8 +77,6 @@ reader:
   roles:
     - reader
   nvmeMaxMB: 4096
-  drain:
-    enabled: true
   persistence:
     enabled: false
   ephemeralCacheSizeLimit: 8Gi

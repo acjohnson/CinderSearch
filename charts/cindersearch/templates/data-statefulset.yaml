@@ -131,15 +131,6 @@ spec:
                   - -c
                   - "wget -qO- --post-data='' http://127.0.0.1:{{ .Values.engine.listenPort }}/_cinder/drain >/dev/null 2>&1 || true"
           {{- end }}
-          {{- if .Values.data.drain.enabled }}
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - sh
-                  - -c
-                  - "wget -qO- --post-data='' http://127.0.0.1:{{ .Values.engine.listenPort }}/_cinder/drain >/dev/null 2>&1 || true"
-          {{- end }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:

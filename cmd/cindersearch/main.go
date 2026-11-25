@@ -720,30 +720,3 @@ func buildDiscoveryConfig(mode string, heartbeatSec, leaseTTLSec, syncSec int) (
 		SyncInterval:      time.Duration(syncSec) * time.Second,
 	}, nil
 }
-
-func buildDiscoveryConfig(mode string, heartbeatSec, leaseTTLSec, syncSec int) (cluster.DiscoveryConfig, error) {
-	m := strings.ToLower(strings.TrimSpace(mode))
-	switch m {
-	case cluster.DiscoveryModeHybrid, cluster.DiscoveryModeS3, cluster.DiscoveryModeStatic:
-	default:
-		return cluster.DiscoveryConfig{}, fmt.Errorf("--discovery-mode must be one of hybrid, s3, static (got %q)", mode)
-	}
-	if heartbeatSec < 1 {
-		return cluster.DiscoveryConfig{}, fmt.Errorf("--heartbeat-sec must be >= 1")
-	}
-	if leaseTTLSec < 2 {
-		return cluster.DiscoveryConfig{}, fmt.Errorf("--lease-ttl-sec must be >= 2")
-	}
-	if leaseTTLSec <= heartbeatSec {
-		return cluster.DiscoveryConfig{}, fmt.Errorf("--lease-ttl-sec (%d) must be greater than --heartbeat-sec (%d)", leaseTTLSec, heartbeatSec)
-	}
-	if syncSec < 1 {
-		return cluster.DiscoveryConfig{}, fmt.Errorf("--membership-sync-sec must be >= 1")
-	}
-	return cluster.DiscoveryConfig{
-		Mode:              m,
-		HeartbeatInterval: time.Duration(heartbeatSec) * time.Second,
-		LeaseTTL:          time.Duration(leaseTTLSec) * time.Second,
-		SyncInterval:      time.Duration(syncSec) * time.Second,
-	}, nil
-}
